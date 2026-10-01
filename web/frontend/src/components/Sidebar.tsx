@@ -9,6 +9,8 @@ import {
 } from './icons';
 import { IconGear } from './settingsIcons';
 
+const HINT_KEY = 'easel_persona_hint_seen';
+
 export type Page = 'dashboard' | 'chat' | 'trends' | 'ideas' | 'calendar' | 'publish' | 'breakdown' | 'skills' | 'outputs' | 'accounts' | 'profile';
 
 interface SidebarProps {
@@ -91,6 +93,17 @@ export default function Sidebar({
   const [renameValue, setRenameValue] = useState('');
   const [showArchived, setShowArchived] = useState(false);
 
+  // 首次引导：未交互过且已有画像时，给下拉框加光晕＋提示语；首次点击即写入标记永久消失。
+  // localStorage 读失败（隐私模式等）→ 永不提示；写失败 → 本次已隐藏，最多下次会话再提示一次。
+  const [showHint, setShowHint] = useState(() => {
+    try { return !localStorage.getItem(HINT_KEY); } catch { return false; }
+  });
+  const dismissHint = () => {
+    if (!showHint) return;
+    try { localStorage.setItem(HINT_KEY, '1'); } catch { /* 写失败可接受 */ }
+    setShowHint(false);
+  };
+
   const startRename = (s: ChatSession) => { setRenamingId(s.id); setRenameValue(s.title); };
   const commitRename = () => {
     if (renamingId) onSessionRename(renamingId, renameValue);
@@ -147,7 +160,10 @@ export default function Sidebar({
           <img className="sidebar-logo-icon" src="./static/easel-icon-transparent.png" alt="" />
           <h1>Atelier</h1>
         </div>
-        <div className="persona-field">
+        <div
+          className={`persona-field ${showHint && personas.length > 0 ? 'hint' : ''}`}
+          onMouseDown={dismissHint}
+        >
           <span className="persona-field-avatar">
             <PersonaAvatar name={selectedPersona} size={18} />
           </span>
@@ -168,6 +184,9 @@ export default function Sidebar({
             <option value="__new__">+ 新建画像…</option>
           </select>
         </div>
+        {showHint && personas.length > 0 && (
+          <div className="persona-hint">运营多个账号？在这里切换画像</div>
+        )}
       </div>
 
       <nav className="sidebar-nav">
