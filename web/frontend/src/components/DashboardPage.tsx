@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import {
   fetchTrends, fetchSchedule, fetchOutputs, fetchAccounts, fetchIdeas,
   fetchAnalyticsPlatforms, fetchAccountAnalytics,
@@ -28,6 +28,20 @@ function growthInfo(n: number | null): { text: string; color: string } | null {
     ? { text: `▲+${fmtNum(n)}`, color: 'var(--trend-up)' }
     : { text: `▼${fmtNum(Math.abs(n))}`, color: 'var(--trend-down)' };
 }
+/** 抓取时间展示：epoch 秒 → 1 天内相对时间、更早 "M-D HH:MM"；字符串（公众号）截 "MM-DD HH:MM"。 */
+function fmtFetchedAt(v: number | string | null | undefined): string {
+  if (typeof v === 'number' && v > 0) {
+    const diff = Date.now() / 1000 - v;
+    if (diff < 90) return '刚刚';
+    if (diff < 3600) return `${Math.floor(diff / 60)} 分钟前`;
+    if (diff < 86400) return `${Math.floor(diff / 3600)} 小时前`;
+    const d = new Date(v * 1000);
+    const p = (x: number) => String(x).padStart(2, '0');
+    return `${d.getMonth() + 1}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+  }
+  if (typeof v === 'string' && v.length >= 16) return v.slice(5, 16);
+  return '';
+}
 
 interface DashboardProps {
   persona: string;
@@ -44,12 +58,16 @@ export default function DashboardPage({ persona, gatewayStatus, onNavigate, onUs
   const [outputs, setOutputs] = useState<OutputNode[]>([]);
   const [accounts, setAccounts] = useState<AccountItem[]>([]);
   const [ideas, setIdeas] = useState<Idea[]>([]);
-  // 归因层：账号创作数据
+  // 归因层：账号创作数据。缓存策略：localStorage（easel_analytics）为持久缓存——
+  // 点平台/来回切换只读缓存；仅当该平台还没有有效数据（首次展示或上次抓取失败）或用户点「刷新」才联网抓。
   const [anaPlats, setAnaPlats] = useState<AnalyticsPlatform[]>([]);
   const [anaSel, setAnaSel] = useState('');
   const [anaData, setAnaData] = useState<Record<string, AccountAnalytics | 'loading' | 'error'>>(() => {
     try { return JSON.parse(localStorage.getItem('easel_analytics') || '{}'); } catch { return {}; }
   });
+  const anaDataRef = useRef(anaData); // 同步镜像：抓取前判定有无缓存，不等异步 setState
+  const [anaFetching, setAnaFetching] = useState<Record<string, boolean>>({}); // 手动刷新中（旧数据仍展示）
+  const [anaRefreshFail, setAnaRefreshFail] = useState<Record<string, boolean>>({});
   const [anaWin, setAnaWin] = useState<'last' | 'day' | 'week' | 'month' | 'year'>('week');
   // whoami 自愈：登录态以真实 profile 为准（与账号页共享 localStorage 缓存）
   const [whoamiMap, setWhoamiMap] = useState<Record<string, AccountWhoami>>(() => getWhoamiCache());
@@ -78,17 +96,52 @@ export default function DashboardPage({ persona, gatewayStatus, onNavigate, onUs
     }).catch(() => {});
   }, []);
 
-  const runAna = (platform: string) => {
-    setAnaSel(platform);
-    setAnaData((d) => ({ ...d, [platform]: 'loading' }));
+  /** 联网抓取。force=false：有缓存直接复用（切平台/重复点击不重新抓）；
+   *  force=true：用户点「刷新」，强制联网。刷新期间保留旧数据继续展示（失败也不丢缓存）。 */
+  const loadAna = (platform: string, force = false) => {
+    const cur = anaDataRef.current[platform];
+    const hasCache = !!cur && cur !== 'loading' && cur !== 'error';
+    if (cur === 'loading' || anaFetching[platform]) return; // 已在抓取：不并发起多个浏览器
+    if (hasCache && !force) return; // 有缓存：直接用，不联网
+    setAnaRefreshFail((f) => ({ ...f, [platform]: false }));
+    setAnaFetching((m) => ({ ...m, [platform]: true }));
+    if (!hasCache) {
+      // 首次展示（或上次失败）：占位 loading 走大 spinner；手动刷新则不清空旧数据
+      const next = { ...anaDataRef.current, [platform]: 'loading' as const };
+      anaDataRef.current = next;
+      setAnaData(next);
+    }
     fetchAccountAnalytics(platform)
-      .then((r) => setAnaData((d) => {
-        const next = { ...d, [platform]: r };
-        try { localStorage.setItem('easel_analytics', JSON.stringify(next)); } catch { /* quota */ }
-        return next;
-      }))
-      .catch(() => setAnaData((d) => ({ ...d, [platform]: 'error' as const })));
+      .then((r) => {
+        const done = { ...anaDataRef.current, [platform]: r };
+        anaDataRef.current = done;
+        setAnaData(done);
+        // 持久缓存只落真实结果，'loading' 占位不落盘，避免刷新页面后卡在加载态
+        const settled = Object.fromEntries(Object.entries(done).filter(([, v]) => v !== 'loading'));
+        try { localStorage.setItem('easel_analytics', JSON.stringify(settled)); } catch { /* quota */ }
+      })
+      .catch(() => {
+        if (!hasCache) {
+          const bad = { ...anaDataRef.current, [platform]: 'error' as const };
+          anaDataRef.current = bad;
+          setAnaData(bad);
+        } else {
+          setAnaRefreshFail((f) => ({ ...f, [platform]: true })); // 刷新失败：旧缓存仍在
+        }
+      })
+      .finally(() => setAnaFetching((m) => {
+        const rest = { ...m };
+        delete rest[platform];
+        return rest;
+      }));
   };
+
+  const selectAna = (platform: string) => {
+    setAnaSel(platform);
+    loadAna(platform); // 没有有效缓存才联网；来回切换/重复点击都直接展示缓存
+  };
+
+  const refreshAna = () => { if (anaSel) loadAna(anaSel, true); };
 
   const hour = new Date().getHours();
   const greet = hour < 6 ? '夜深了' : hour < 12 ? '上午好' : hour < 14 ? '中午好' : hour < 18 ? '下午好' : '晚上好';
@@ -211,13 +264,24 @@ export default function DashboardPage({ persona, gatewayStatus, onNavigate, onUs
           ))}
         </div>
 
-        {/* 创作数据（归因层）：选平台自动拉取登录账号的粉丝/获赞/关注 + 多窗口增长 + 近7日环比 + 最新笔记 */}
+        {/* 创作数据（归因层）：缓存优先——首次展示/手动「刷新」才联网抓取，切换平台读缓存（localStorage easel_analytics） */}
         <div className="card dash-card dash-card-wide">
           <div className="dash-card-head">
             <span><IconAccounts size={16} /> 创作数据</span>
-            {anaSel && anaData[anaSel] && anaData[anaSel] !== 'loading' && (
-              <button className="dash-more" onClick={() => runAna(anaSel)}>刷新 →</button>
-            )}
+            {(() => {
+              const cur = anaSel ? anaData[anaSel] : undefined;
+              if (!cur || cur === 'loading' || cur === 'error') return null;
+              return (
+                <span className="ana-head-ops">
+                  <span className="ana-fresh" title="缓存数据的抓取时间：切换平台不重新联网，点「刷新」获取最新">
+                    {fmtFetchedAt(cur.fetched_at)}
+                  </span>
+                  {anaFetching[anaSel]
+                    ? <span className="dash-more">刷新中…</span>
+                    : <button className="dash-more" onClick={refreshAna}>刷新 →</button>}
+                </span>
+              );
+            })()}
           </div>
           {(() => {
             const logged = anaPlats.filter((p) => p.loggedIn || whoamiMap[p.platform]?.loggedIn);
@@ -238,9 +302,12 @@ export default function DashboardPage({ persona, gatewayStatus, onNavigate, onUs
                 <div className="ana-plats">
                   {logged.map((p) => (
                     <button key={p.platform} className={`chip ${anaSel === p.platform ? 'active' : ''}`}
-                      onClick={() => runAna(p.platform)}>{p.name}</button>
+                      onClick={() => selectAna(p.platform)}>{p.name}</button>
                   ))}
                 </div>
+                {anaSel && anaRefreshFail[anaSel] && (
+                  <div className="ana-refresh-fail">刷新失败（未登录 / 网络问题），仍显示上次缓存的数据，可稍后重试</div>
+                )}
                 {!d && <div className="dash-empty">点上方平台查看该账号数据</div>}
                 {d === 'loading' && (
                   <div className="loading" style={{ padding: '28px 0' }}><div className="spinner" />抓取中…（起浏览器，约数秒）</div>

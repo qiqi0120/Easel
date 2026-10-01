@@ -545,7 +545,8 @@ export interface AccountAnalytics {
   notes: { title: string; url: string; cover?: string; stat?: string }[];
   growth: Record<'last' | 'day' | 'week' | 'month' | 'year',
     { followers: number | null; likes: number | null; posts: number | null; since_days: number | null } | null>;
-  fetched_at: number;
+  /** epoch 秒；公众号走 weixin_mp_stats，返回 "YYYY-MM-DD HH:MM:SS" 字符串。 */
+  fetched_at: number | string;
 }
 
 /** 支持抓数据的平台 + 各自登录态。 */
