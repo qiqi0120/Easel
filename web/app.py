@@ -3091,7 +3091,7 @@ async def api_media(path: str):
 
 
 # 系统数据目录/文件——不允许从内容库删除（删了会丢登录态/日历/发布记录）
-PROTECTED_OUTPUTS = {"_login", "_analytics", "_schedule.json", "_ideas.json",
+PROTECTED_OUTPUTS = {"_login", "_analytics", "_schedule.json", "_ideas.json", "_watchlist.json",
                      "_publish", "_publish.log", "_sessions", "_profile_build", "_debug", "_inbox"}
 UPLOAD_EXTS = IMAGE_EXTS | VIDEO_EXTS | {
     ".pdf", ".txt", ".md", ".markdown", ".csv", ".json", ".srt", ".vtt",
@@ -4165,6 +4165,166 @@ async def api_trends(platforms: str = "weibo,douyin,zhihu", limit: int = 12):
             "items": items[:max(1, min(limit, 30))],
         })
     return {"trends": result, "updated": int(now)}
+
+
+# ---- 自选博主热点（watchlist） ----
+# 用户关注的博主/媒体 RSS 源：热点雷达「我的关注」分区与对话内 RSS 技能共用同一份列表。
+# 存储沿用 _schedule.json 模式（outputs/ 下下划线前缀系统文件，见 PROTECTED_OUTPUTS）。
+# RSS 路径：无 RSS 的博主由用户经 RSSHub 等生成后填 feed_url，本层不做平台→路由映射。
+WATCHLIST_FILE = OUTPUTS_DIR / "_watchlist.json"
+WATCHLIST_CACHE_TTL = 300                    # 与 _TREND_CACHE 一致
+WATCHLIST_MAX_PER_SOURCE = 15                # 单源最多返回条数（面板一屏够用）
+WATCHLIST_SINCE_DAYS = 7                     # 面板固定最近 N 天窗口
+_WATCH_CACHE: dict[str, tuple[float, list]] = {}   # feed_url → (时间, 条目)，失败回落旧值
+_RSS_DIGEST = SKILLS_DIR / "openclaw" / "skill-rss-aggregator" / "scripts" / "rss_digest.py"
+
+
+def _read_watchlist() -> list[dict]:
+    if not WATCHLIST_FILE.is_file():
+        return []
+    try:
+        d = json.loads(WATCHLIST_FILE.read_text(encoding="utf-8"))
+        return d if isinstance(d, list) else []
+    except Exception:
+        return []
+
+
+def _write_watchlist(items: list[dict]) -> None:
+    OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = WATCHLIST_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(WATCHLIST_FILE)
+
+
+class WatchlistItem(BaseModel):
+    name: str
+    platform: str = ""
+    feed_url: str
+    note: str = ""
+    enabled: bool = True
+
+
+def _fetch_rss_source(feed_url: str) -> list[dict]:
+    """单源抓取：调 rss_digest.py fetch（纯标准库，含 HTML 清洗/去重/排序），stdout 取 JSON。
+
+    单源一个子进程（按博主精确归组）；rss_digest 对单源拉取失败只警告不打断，
+    返回 {"count": 0, "items": []}，所以这里只吞进程级错误，源级失败自然得到空列表。
+    """
+    cmd = [sys.executable, str(_RSS_DIGEST), "fetch", "--url", feed_url,
+           "--since", str(WATCHLIST_SINCE_DAYS), "--limit", str(WATCHLIST_MAX_PER_SOURCE),
+           "--format", "json"]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
+                              errors="replace", timeout=45, cwd=str(PROJECT_ROOT),
+                              env=_proxy_env())
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if proc.returncode != 0:
+        return []
+    try:
+        d = json.loads(proc.stdout)
+    except ValueError:
+        return []
+    items = d.get("items") if isinstance(d, dict) else None
+    return [it for it in items if isinstance(it, dict)] if isinstance(items, list) else []
+
+
+@app.get("/api/watchlist")
+async def api_watchlist_list():
+    return _read_watchlist()
+
+
+@app.post("/api/watchlist")
+async def api_watchlist_add(req: WatchlistItem):
+    feed_url = req.feed_url.strip()
+    if not _valid_base_url(feed_url):
+        raise HTTPException(400, "feed_url 必须是 http(s)://host 形式的 RSS/Atom 地址")
+    items = _read_watchlist()
+    if any(w.get("feed_url", "").rstrip("/") == feed_url.rstrip("/") for w in items):
+        raise HTTPException(400, "该订阅源已在关注列表里")
+    item = {
+        "id": f"wl-{uuid.uuid4().hex[:8]}",
+        "name": req.name.strip() or feed_url,
+        "platform": req.platform.strip(),
+        "feed_url": feed_url,
+        "note": req.note,
+        "enabled": req.enabled,
+        "added_at": int(time.time()),
+    }
+    items.insert(0, item)
+    _write_watchlist(items)
+    return item
+
+
+@app.put("/api/watchlist/{wid}")
+async def api_watchlist_update(wid: str, req: WatchlistItem):
+    feed_url = req.feed_url.strip()
+    if not _valid_base_url(feed_url):
+        raise HTTPException(400, "feed_url 必须是 http(s)://host 形式的 RSS/Atom 地址")
+    items = _read_watchlist()
+    for it in items:
+        if it.get("id") == wid:
+            it.update({
+                "name": req.name.strip() or it.get("name", feed_url),
+                "platform": req.platform.strip(),
+                "feed_url": feed_url,
+                "note": req.note,
+                "enabled": req.enabled,
+            })
+            _write_watchlist(items)
+            _WATCH_CACHE.clear()   # 换源/启停后丢弃全部缓存，下轮 digest 现拉
+            return it
+    raise HTTPException(404, "关注条目不存在")
+
+
+@app.delete("/api/watchlist/{wid}")
+async def api_watchlist_delete(wid: str):
+    items = _read_watchlist()
+    new = [it for it in items if it.get("id") != wid]
+    if len(new) == len(items):
+        raise HTTPException(404, "关注条目不存在")
+    _write_watchlist(new)
+    _WATCH_CACHE.clear()
+    return {"ok": True, "deleted": wid}
+
+
+@app.get("/api/watchlist/digest")
+async def api_watchlist_digest():
+    """聚合所有启用博主源的最近更新，按博主分组（形状对齐 TrendGroup 供前端复用）。
+
+    每源独立缓存（300s，与 _TREND_CACHE 同模式）：单源失败回落旧值，面板
+    永不因单个死源报错；并发抓各源，整体耗时≈最慢一源。
+    """
+    feeds = [w for w in _read_watchlist()
+             if w.get("enabled", True) and _valid_base_url(w.get("feed_url", ""))]
+    loop = asyncio.get_event_loop()
+    now = time.time()
+
+    async def one(w: dict) -> dict:
+        url = w["feed_url"]
+        c = _WATCH_CACHE.get(url)
+        if c and now - c[0] < WATCHLIST_CACHE_TTL:
+            items = c[1]
+        else:
+            items = await loop.run_in_executor(None, _fetch_rss_source, url)
+            if items:
+                _WATCH_CACHE[url] = (now, items)
+            elif c:
+                items = c[1]
+        return {
+            "id": w.get("id", ""),
+            "name": w.get("name", ""),
+            "platform": w.get("platform", ""),
+            "items": [
+                {"title": it.get("title", ""), "url": it.get("link", ""),
+                 "date": it.get("_dt") or it.get("published", ""),
+                 "summary": it.get("summary", "")}
+                for it in items[:WATCHLIST_MAX_PER_SOURCE]
+            ],
+        }
+
+    groups = list(await asyncio.gather(*(one(w) for w in feeds)))
+    return {"groups": groups, "updated": int(now)}
 
 
 SCHEDULE_FILE = OUTPUTS_DIR / "_schedule.json"

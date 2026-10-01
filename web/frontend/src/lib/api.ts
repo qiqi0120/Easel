@@ -175,6 +175,38 @@ export function fetchTrends(platforms: string, limit = 12): Promise<{ trends: Tr
   return request(`/api/trends?platforms=${encodeURIComponent(platforms)}&limit=${limit}`);
 }
 
+// ---- 自选博主热点（watchlist）----
+export interface WatchEntry {
+  id: string; name: string; platform: string; feed_url: string;
+  note: string; enabled: boolean; added_at: number;
+}
+export interface WatchDigestItem { title: string; url: string; date: string; summary: string; }
+export interface WatchGroup { id: string; name: string; platform: string; items: WatchDigestItem[]; }
+
+export function fetchWatchlist(): Promise<WatchEntry[]> {
+  return request('/api/watchlist');
+}
+export function addWatchlist(entry: { name: string; platform: string; feed_url: string; note: string }): Promise<WatchEntry> {
+  return request('/api/watchlist', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(entry),
+  });
+}
+export function updateWatchlist(id: string, entry: { name: string; platform: string; feed_url: string; note: string; enabled: boolean }): Promise<WatchEntry> {
+  return request(`/api/watchlist/${encodeURIComponent(id)}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(entry),
+  });
+}
+export function deleteWatchlist(id: string): Promise<{ ok: boolean; deleted: string }> {
+  return request(`/api/watchlist/${encodeURIComponent(id)}`, { method: 'DELETE' });
+}
+export function fetchWatchDigest(): Promise<{ groups: WatchGroup[]; updated: number }> {
+  return request('/api/watchlist/digest');
+}
+
 // ---- 内容排期 ----
 export interface ScheduleItem {
   id: string; title: string; date: string; platform: string;

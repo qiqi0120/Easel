@@ -24,6 +24,11 @@ layer: discover
 | 关键词 | 可选 | 只保留标题/摘要命中的条目（逗号分隔） |
 | 时间窗 | 可选 | 只保留最近 N 天 |
 
+**默认订阅源（Web「我的关注」列表）**：用户没给订阅源、只说"看看我关注的博主 / 我订阅的更新"时，
+先读 `outputs/_watchlist.json`（数组，取 `enabled=true` 条目的 `feed_url`，`name` 作展示名），
+把这些 URL 当 `--url` 逐个传入；该文件不存在或为空才向用户要源。
+这份列表与 Web 热点雷达「我的关注」分区共用，不要改写它，只读取。
+
 ## 执行
 
 脚本路径（相对项目根）：`skills/openclaw/skill-rss-aggregator/scripts/rss_digest.py`。
