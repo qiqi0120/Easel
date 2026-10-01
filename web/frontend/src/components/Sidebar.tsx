@@ -40,6 +40,35 @@ const NAV: { page: Page; Icon: ComponentType<{ size?: number }>; label: string }
   { page: 'profile', Icon: IconProfile, label: '画像' },
 ];
 
+// 画像头像圆点：底色按画像名哈希从 6 色色板（--persona-c1..c6，见 index.css）轮转，
+// 同名画像永远同色；size < 12px 时首字不可读，只渲染色点。
+const PERSONA_PALETTE_SIZE = 6;
+
+function personaColorIndex(name: string): number {
+  let hash = 0;
+  for (const ch of name) hash = (hash * 31 + (ch.codePointAt(0) ?? 0)) >>> 0;
+  return hash % PERSONA_PALETTE_SIZE;
+}
+
+function PersonaAvatar({ name, size = 18 }: { name: string; size?: number }) {
+  if (!name) {
+    return <span className="persona-avatar generic" style={{ width: size, height: size }} />;
+  }
+  return (
+    <span
+      className="persona-avatar"
+      style={{
+        width: size,
+        height: size,
+        background: `var(--persona-c${personaColorIndex(name) + 1})`,
+        fontSize: Math.round(size * 0.56),
+      }}
+    >
+      {size >= 12 ? Array.from(name)[0] : null}
+    </span>
+  );
+}
+
 export default function Sidebar({
   currentPage,
   onPageChange,
@@ -116,24 +145,29 @@ export default function Sidebar({
       <div className="sidebar-header">
         <div className="sidebar-logo">
           <img className="sidebar-logo-icon" src="./static/easel-icon-transparent.png" alt="" />
-          <h1>Easel</h1>
+          <h1>Atelier</h1>
         </div>
-        <select
-          className="persona-select"
-          value={selectedPersona}
-          onChange={(e) => {
-            if (e.target.value === '__new__') { onNewProfile(); return; }
-            onPersonaChange(e.target.value);
-          }}
-          disabled={activeSessionHasMessages}
-          title={activeSessionHasMessages ? '当前对话已绑定画像，切换画像将新建对话' : '选择用户画像'}
-        >
-          <option value="">通用模式</option>
-          {personas.map((p) => (
-            <option key={p.name} value={p.name}>{p.name}</option>
-          ))}
-          <option value="__new__">+ 新建画像…</option>
-        </select>
+        <div className="persona-field">
+          <span className="persona-field-avatar">
+            <PersonaAvatar name={selectedPersona} size={18} />
+          </span>
+          <select
+            className="persona-select"
+            value={selectedPersona}
+            onChange={(e) => {
+              if (e.target.value === '__new__') { onNewProfile(); return; }
+              onPersonaChange(e.target.value);
+            }}
+            disabled={activeSessionHasMessages}
+            title={activeSessionHasMessages ? '当前对话已绑定画像，切换画像将新建对话' : '选择用户画像'}
+          >
+            <option value="">通用模式</option>
+            {personas.map((p) => (
+              <option key={p.name} value={p.name}>{p.name}</option>
+            ))}
+            <option value="__new__">+ 新建画像…</option>
+          </select>
+        </div>
       </div>
 
       <nav className="sidebar-nav">

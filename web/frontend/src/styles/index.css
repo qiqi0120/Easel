@@ -33,6 +33,14 @@
   --layer-attribute: #d97706;
   --layer-general: #64748b;
 
+  /* ---- Persona avatar palette（画像头像圆点，按名字哈希轮转，取值对齐 --layer-* 六色）---- */
+  --persona-c1: #0ea5e9;
+  --persona-c2: #7c3aed;
+  --persona-c3: #db2777;
+  --persona-c4: #059669;
+  --persona-c5: #d97706;
+  --persona-c6: #64748b;
+
   /* ---- Shape & motion ---- */
   --sidebar-width: 264px;
   --radius-sm: 6px;
@@ -115,23 +123,45 @@ body {
   box-shadow: 0 5px 14px rgba(51, 66, 148, 0.1);
 }
 
+.persona-field { position: relative; }
+
+.persona-field-avatar {
+  position: absolute; left: 12px; top: 50%; transform: translateY(-50%);
+  pointer-events: none; z-index: 1;
+  display: inline-flex;
+}
+
+.persona-avatar {
+  display: inline-flex; align-items: center; justify-content: center;
+  border-radius: 50%;
+  color: #fff;
+  font-weight: 700;
+  line-height: 1;
+  flex: none;
+  user-select: none;
+}
+.persona-avatar.generic { background: var(--text-tertiary); }
+
 .persona-select {
   width: 100%;
-  padding: 9px 12px;
+  padding: 10px 30px 10px 38px;
   background: var(--bg-elev);
-  border: 1px solid var(--border);
+  border: 1px solid var(--border-strong);
   border-radius: var(--radius);
   color: var(--text);
-  font-size: 13px;
+  font-size: 14px;
+  font-weight: 600;
   cursor: pointer;
   outline: none;
   appearance: none;
   transition: border-color var(--t-fast);
   background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%23a0a0aa' stroke-width='2'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
   background-repeat: no-repeat;
-  background-position: right 10px center;
+  background-position: right 12px center;
 }
+.persona-select:hover:not(:disabled) { border-color: var(--text-tertiary); }
 .persona-select:focus { border-color: var(--accent-start); }
+.persona-select:disabled { cursor: not-allowed; opacity: 0.6; }
 
 .sidebar-nav { padding: 10px 8px; display: flex; flex-direction: column; gap: 2px; }
 
@@ -877,6 +907,10 @@ textarea.field { resize: vertical; min-height: 90px; }
 .trend-item:hover .trend-use { opacity: 1; }
 .trend-use:hover { background: var(--accent-soft); border-color: transparent; }
 .trend-empty { color: var(--text-tertiary); font-size: 13px; padding: 10px 12px; }
+/* 我的关注:缩略图 + 多行标题(抖音长文案) */
+.watch-cover { width: 56px; height: 74px; object-fit: cover; border-radius: 8px; flex-shrink: 0; background: var(--surface-hover); }
+.watch-title { white-space: normal; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; line-height: 1.35; }
+.watch-meta { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 2px; }
 
 /* ============ 内容日历 ============ */
 .cal-nav { display: flex; align-items: center; gap: 8px; }
