@@ -177,6 +177,8 @@ body {
   color: var(--text-secondary);
 }
 
+.session-persona-dot { flex: none; display: inline-flex; margin-left: 4px; }
+
 .sidebar-nav { padding: 10px 8px; display: flex; flex-direction: column; gap: 2px; }
 
 .nav-item {
