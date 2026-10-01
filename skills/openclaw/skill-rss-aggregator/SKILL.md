@@ -29,6 +29,11 @@ layer: discover
 把这些 URL 当 `--url` 逐个传入；该文件不存在或为空才向用户要源。
 这份列表与 Web 热点雷达「我的关注」分区共用，不要改写它，只读取。
 
+> **例外——抖音条目**：`platform == "douyin"` 的条目不走 RSS（抖音 WAF 拦无 Cookie 抓取），
+> 改用登录态抓取：`python skills/shared/scripts/douyin_watch.py fetch --uid <条目uid> --limit 10`。
+> uid 字段为空时从 feed_url 里反解（`douyin.com/user/<sec_uid>`）。脚本 exit 8 表示抖音未登录，
+> 引导用户先在 Web「账号」页登录。
+
 ## 执行
 
 脚本路径（相对项目根）：`skills/openclaw/skill-rss-aggregator/scripts/rss_digest.py`。

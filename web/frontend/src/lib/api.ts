@@ -180,7 +180,7 @@ export interface WatchEntry {
   id: string; name: string; platform: string; feed_url: string;
   note: string; enabled: boolean; added_at: number;
 }
-export interface WatchDigestItem { title: string; url: string; date: string; summary: string; }
+export interface WatchDigestItem { title: string; url: string; date: string; summary: string; cover?: string; }
 export interface WatchGroup { id: string; name: string; platform: string; items: WatchDigestItem[]; }
 
 export function fetchWatchlist(): Promise<WatchEntry[]> {
@@ -205,6 +205,17 @@ export function deleteWatchlist(id: string): Promise<{ ok: boolean; deleted: str
 }
 export function fetchWatchDigest(): Promise<{ groups: WatchGroup[]; updated: number }> {
   return request('/api/watchlist/digest');
+}
+// 当前抖音账号的收藏视频（登录态抓取）；error 非空=未登录/风控等，items 此时为空
+export function fetchDouyinCollect(refresh = false): Promise<{ items: WatchDigestItem[]; error: string; updated: number }> {
+  return request(`/api/watchlist/collect${refresh ? '?refresh=1' : ''}`);
+}
+export function resolveRssRoute(platform: string, blogger: string): Promise<{ feed_url: string }> {
+  return request('/api/watchlist/rss-route', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ platform, blogger }),
+  });
 }
 
 // ---- 内容排期 ----

@@ -4229,6 +4229,122 @@ def _fetch_rss_source(feed_url: str) -> list[dict]:
     return [it for it in items if isinstance(it, dict)] if isinstance(items, list) else []
 
 
+_DOUYIN_WATCH = SKILLS_DIR / "shared" / "scripts" / "douyin_watch.py"
+
+
+def _script_python() -> str:
+    """跑 douyin_watch（playwright 无头浏览器）用的解释器：项目 .venv 优先。
+
+    Web 服务本身可能被系统/homebrew Python 拉起（没装 playwright），子进程若沿用
+    sys.executable 会 ModuleNotFoundError、抖音抓取静默失败；项目 .venv 由安装脚本
+    统一装好依赖，存在即用。"""
+    venv_py = PROJECT_ROOT / ".venv" / "bin" / "python"
+    return str(venv_py) if venv_py.is_file() else sys.executable
+
+
+def _douyin_uid_from_feed(feed_url: str) -> str:
+    """从自动生成的抖音 feed 标记地址里反解博主 sec_uid。
+
+    两种形态都认：douyin.com/user/<uid>（官网）与 <任意host>/douyin/user/<uid>（RSSHub 路由标记）。
+    """
+    m = re.search(r"douyin(?:\.com)?/user/(MS4wLjABAAAA[A-Za-z0-9_-]+)", feed_url or "")
+    return m.group(1) if m else ""
+
+
+def _fetch_douyin_source(uid: str) -> list[dict]:
+    """登录态抓抖音博主最新作品（douyin_watch.py 旁听 aweme API）。
+
+    未登录/超时/风控 → 返回 []（脚本侧 exit 8/6），面板按「暂不可用」处理不报错。
+    脚本内部 --no-proxy-server 直连，这里 env 走 _proxy_env() 仅透传常规变量。
+    """
+    cmd = [_script_python(), str(_DOUYIN_WATCH), "fetch", "--uid", uid,
+           "--limit", str(WATCHLIST_MAX_PER_SOURCE), "--timeout", "60", "--format", "json"]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
+                              errors="replace", timeout=90, cwd=str(PROJECT_ROOT),
+                              env=_proxy_env())
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if proc.returncode != 0:
+        return []
+    try:
+        d = json.loads(proc.stdout)
+    except ValueError:
+        return []
+    items = d.get("items") if isinstance(d, dict) else None
+    out = []
+    for it in items if isinstance(items, list) else []:
+        if not isinstance(it, dict):
+            continue
+        summary = " · ".join(f"{k} {v}" for k, v in
+                             (("赞", it.get("digg")), ("评", it.get("comment"))) if v is not None)
+        out.append({"title": it.get("title", ""), "link": it.get("url", ""),
+                    "summary": summary, "published": it.get("created", ""),
+                    "cover": it.get("cover", ""), "feed": it.get("feed", "")})
+    return out
+
+
+_COLLECT_CACHE_KEY = "__douyin_collect__"
+COLLECT_CACHE_TTL_ERR = 60   # 失败（未登录/风控）缓存更短，登录后能较快重试
+
+
+def _fetch_douyin_collect() -> tuple[list[dict], str]:
+    """登录态拉当前账号的抖音收藏（douyin_watch.py collect 旁听 listcollection API）。
+
+    返回 (digest 条目, 错误提示)。未登录（exit 8）/超时风控（exit 6）不抛错，带回
+    人话提示给面板展示——收藏 tab 的核心依赖是登录态，值得显式说原因而非静默空白。
+    """
+    cmd = [_script_python(), str(_DOUYIN_WATCH), "collect",
+           "--limit", str(WATCHLIST_MAX_PER_SOURCE), "--timeout", "60", "--format", "json"]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
+                              errors="replace", timeout=90, cwd=str(PROJECT_ROOT),
+                              env=_proxy_env())
+    except (OSError, subprocess.SubprocessError):
+        return [], "收藏拉取失败——本机执行环境异常，请稍后重试"
+    if proc.returncode == 8:
+        return [], "抖音未登录——请先在「账号」页登录抖音，再回来刷新"
+    if proc.returncode != 0:
+        return [], "收藏拉取超时（可能被风控拦截）——稍后重试"
+    try:
+        d = json.loads(proc.stdout)
+    except ValueError:
+        return [], "收藏数据解析失败——稍后重试"
+    items = d.get("items") if isinstance(d, dict) else None
+    out = []
+    for it in items if isinstance(items, list) else []:
+        if not isinstance(it, dict):
+            continue
+        parts = []
+        if it.get("author"):
+            parts.append(f"作者 {it['author']}")
+        parts += [f"{k} {v}" for k, v in
+                  (("赞", it.get("digg")), ("评", it.get("comment"))) if v is not None]
+        out.append({"title": it.get("title", ""), "url": it.get("url", ""),
+                    "date": it.get("created", ""), "summary": " · ".join(parts),
+                    "cover": it.get("cover", "")})
+    return out, ""
+
+
+@app.get("/api/watchlist/collect")
+async def api_watchlist_collect(refresh: int = 0):
+    """当前抖音账号的收藏视频列表（登录态抓取，形状对齐 watchlist digest 条目）。
+
+    每次抓取要起一次无头浏览器，成功缓存 300s（与博主源一致）；失败缓存 60s，
+    避免反复拉起浏览器；refresh=1 强制绕过缓存现拉（面板刷新按钮用）。
+    """
+    now = time.time()
+    c = _WATCH_CACHE.get(_COLLECT_CACHE_KEY)
+    if c and not refresh:
+        ttl = WATCHLIST_CACHE_TTL if not c[2] else COLLECT_CACHE_TTL_ERR
+        if now - c[0] < ttl:
+            return {"items": c[1], "error": c[2], "updated": int(c[0])}
+    loop = asyncio.get_event_loop()
+    items, err = await loop.run_in_executor(None, _fetch_douyin_collect)
+    _WATCH_CACHE[_COLLECT_CACHE_KEY] = (now, items, err)
+    return {"items": items, "error": err, "updated": int(now)}
+
+
 @app.get("/api/watchlist")
 async def api_watchlist_list():
     return _read_watchlist()
@@ -4247,6 +4363,8 @@ async def api_watchlist_add(req: WatchlistItem):
         "name": req.name.strip() or feed_url,
         "platform": req.platform.strip(),
         "feed_url": feed_url,
+        # 抖音不走 RSS：存 sec_uid，digest 按平台分流到登录态抓取
+        "uid": _douyin_uid_from_feed(feed_url) if req.platform.strip() == "douyin" else "",
         "note": req.note,
         "enabled": req.enabled,
         "added_at": int(time.time()),
@@ -4268,6 +4386,7 @@ async def api_watchlist_update(wid: str, req: WatchlistItem):
                 "name": req.name.strip() or it.get("name", feed_url),
                 "platform": req.platform.strip(),
                 "feed_url": feed_url,
+                "uid": _douyin_uid_from_feed(feed_url) if req.platform.strip() == "douyin" else "",
                 "note": req.note,
                 "enabled": req.enabled,
             })
@@ -4301,30 +4420,99 @@ async def api_watchlist_digest():
     now = time.time()
 
     async def one(w: dict) -> dict:
-        url = w["feed_url"]
-        c = _WATCH_CACHE.get(url)
+        # 平台分流：抖音走登录态抓取（键=sec_uid），其余走 RSS（键=feed_url）
+        if w.get("platform") == "douyin":
+            key = w.get("uid") or _douyin_uid_from_feed(w.get("feed_url", ""))
+            fetch = _fetch_douyin_source if key else None
+        else:
+            key = w["feed_url"]
+            fetch = _fetch_rss_source
+        c = _WATCH_CACHE.get(key)
         if c and now - c[0] < WATCHLIST_CACHE_TTL:
             items = c[1]
-        else:
-            items = await loop.run_in_executor(None, _fetch_rss_source, url)
+        elif fetch is not None:
+            items = await loop.run_in_executor(None, fetch, key)
             if items:
-                _WATCH_CACHE[url] = (now, items)
+                _WATCH_CACHE[key] = (now, items)
             elif c:
-                items = c[1]
+                items = c[1]   # 失败回落旧值，面板不因单源抖动报错
+        else:
+            items = []
+        # 自动命名：名称为空或拿 URL 充数时，用数据源自带的源标题（RSS feed title /
+        # 抖音博主昵称）回填并持久化——用户手填过的名字不动。
+        display = (w.get("name") or "").strip()
+        if _name_is_placeholder(display, w.get("feed_url", "")):
+            feed_title = next((it.get("feed", "") for it in items if it.get("feed")), "")
+            if feed_title:
+                display = feed_title
+                if w.get("name") != display:
+                    w["name"] = display
+                    name_dirty.append(1)
         return {
             "id": w.get("id", ""),
-            "name": w.get("name", ""),
+            "name": display,
             "platform": w.get("platform", ""),
             "items": [
                 {"title": it.get("title", ""), "url": it.get("link", ""),
                  "date": it.get("_dt") or it.get("published", ""),
-                 "summary": it.get("summary", "")}
+                 "summary": it.get("summary", ""), "cover": it.get("cover", "")}
                 for it in items[:WATCHLIST_MAX_PER_SOURCE]
             ],
         }
 
+    def _name_is_placeholder(name: str, feed_url: str) -> bool:
+        n = (name or "").strip()
+        return (not n or n == feed_url.strip()
+                or n.startswith(("http://", "https://")))
+
+    name_dirty: list[int] = []
+
     groups = list(await asyncio.gather(*(one(w) for w in feeds)))
+    if name_dirty:
+        _write_watchlist(feeds)   # 自动命名回填持久化（用户手填的名字不会被覆盖）
     return {"groups": groups, "updated": int(now)}
+
+
+# RSSHub 实例：环境变量 > 项目 .env > 公共实例。本机自建实例（默认 1200 端口）在
+# .env 配 EASEL_RSSHUB_BASE=http://127.0.0.1:1200 即可全走本地，不依赖线上。
+_RSSHUB_BASE = (os.environ.get("EASEL_RSSHUB_BASE")
+                or _read_env().get("EASEL_RSSHUB_BASE")
+                or "https://rsshub.app").rstrip("/")
+# 平台 → (博主 ID 提取正则, 路由模板)。第一组=主页链接中的 ID，第二组=裸 ID。
+# 路由依据 RSSHub 官方文档（bilibili/user/video、douyin/user、xiaohongshu/user/:uid/notes）。
+_RSS_ROUTES: dict[str, tuple[str, str]] = {
+    "douyin": (r"douyin\.com/user/([A-Za-z0-9_-]+)|^([A-Za-z0-9_-]{15,})$",
+               "{base}/douyin/user/{uid}"),
+    "bilibili": (r"space\.bilibili\.com/(\d+)|^(\d+)$",
+                 "{base}/bilibili/user/video/{uid}"),
+    "xiaohongshu": (r"xiaohongshu\.com/user/profile/([0-9a-f]{24})|^([0-9a-f]{24})$",
+                    "{base}/xiaohongshu/user/{uid}/notes"),
+}
+
+
+def _resolve_feed_url(platform: str, blogger: str) -> str:
+    """按平台从「博主 ID 或主页链接」生成 RSSHub feed 地址；识别不了抛 400。"""
+    rule = _RSS_ROUTES.get(platform)
+    if not rule:
+        raise HTTPException(400, f"平台「{platform}」不支持自动生成，请手填 RSS 地址")
+    pattern, tpl = rule
+    m = re.search(pattern, (blogger or "").strip(), re.IGNORECASE)
+    if not m:
+        raise HTTPException(
+            400, f"无法从「{blogger}」识别 {platform} 博主 ID——请粘贴博主主页链接或直接填 ID")
+    uid = m.group(1) or m.group(2)
+    return tpl.format(base=_RSSHUB_BASE, uid=uid)
+
+
+class RssRouteRequest(BaseModel):
+    platform: str
+    blogger: str
+
+
+@app.post("/api/watchlist/rss-route")
+async def api_watchlist_rss_route(req: RssRouteRequest):
+    """平台 + 博主(ID 或主页链接) → RSS 地址。「我的关注」表单自动生成用。"""
+    return {"feed_url": _resolve_feed_url(req.platform, req.blogger)}
 
 
 SCHEDULE_FILE = OUTPUTS_DIR / "_schedule.json"
