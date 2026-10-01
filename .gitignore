@@ -12,12 +12,14 @@ build/
 .env
 .env.local
 .env.xhs
+.venv/
 
 # Docker
 docker/data/
 
 # IDE
 .idea/
+.vscode/
 *.swp
 *.swo
 *~
