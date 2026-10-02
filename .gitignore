@@ -87,3 +87,6 @@ skills/openclaw/video-production/vendor/**/node_modules/
 skills/openclaw/video-production/vendor/**/.remotion/
 skills/openclaw/video-production/vendor/**/models/
 skills/openclaw/video-production/vendor/**/*large-v3*
+
+# ZCode 会话工具状态（计划草稿等）
+.zcode/
