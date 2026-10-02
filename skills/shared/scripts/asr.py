@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""asr.py — 语音转字幕（ASR）的确定性封装（faster-whisper + 标准库）。
+"""asr.py — 语音转字幕（ASR）的确定性封装（faster-whisper / SenseVoice 双引擎）。
 
 所有"语音/视频 → 字幕文件"类 SKILL（auto-subtitle 等）共用此脚本，避免每次
 现场即兴调 whisper 导致的模型选择、时间戳格式、中文断句不一致等问题。
@@ -7,8 +7,15 @@
 与 video_ops.py 的边界：本脚本只负责"识别语音 → 生成字幕文件（SRT/ASS/TXT/JSON）"，
 不负责把字幕烧录进视频；烧录用 video_ops.py 或 ffmpeg subtitles/ass 滤镜。
 
-依赖：faster-whisper（`pip install faster-whisper`）+ ffmpeg（视频提取音轨）。
-首次运行会从 HuggingFace 下载模型，需外网代理（见下方 _ensure_proxy）。
+双引擎（--engine）：
+    whisper     faster-whisper（CTranslate2），带词级时间戳，支持全部输出格式；
+                模型走 HuggingFace（首次需外网代理，见 _ensure_proxy）。
+    sensevoice  阿里 FunASR 开源 SenseVoice-Small，中文口播效果第一梯队、CPU 上
+                RTF≈0.04（比 whisper 快一个量级），带标点/情绪标记；但**无词级
+                时间戳**，只支持 --format txt。模型走 ModelScope 国内源直连
+                （~/.cache/modelscope），不需要代理。转写库（web 做内容链路）默认用它。
+
+依赖：faster-whisper 或 funasr+torch（按引擎）+ ffmpeg（视频提取音轨）。
 
 子命令（均支持 -h）：
     transcribe  音频/视频 → 字幕（--format srt/ass/txt/json）
@@ -17,6 +24,7 @@
 用法举例：
     asr.py transcribe -i talk.mp4 -o outputs/talk/talk.srt --language zh
     asr.py transcribe -i voice.mp3 --format ass --model small
+    asr.py transcribe -i voice.mp3 --format txt --engine sensevoice
     asr.py info
     asr.py --selftest
 """
@@ -344,6 +352,34 @@ def _transcribe_audio(audio: Path, a) -> tuple[list[tuple[float, float, str]], d
     return cues, meta
 
 
+def _transcribe_sensevoice(audio: Path, a) -> str:
+    """SenseVoice-Small 引擎：中文口播效果第一梯队，CPU 上比 whisper 快一个量级。
+
+    模型从 ModelScope 国内源直连下载并缓存（~/.cache/modelscope），不走代理——
+    _ensure_proxy 注入的境外代理反而会把 ModelScope 绕慢，所以这里刻意不调它。
+    无词级时间戳，只产出整段文本（标点/情绪标记由 rich_transcription_postprocess
+    归一成可读字符）；a.model 忽略（whisper 的模型档位对它无意义）。"""
+    try:
+        from funasr import AutoModel
+        from funasr.utils.postprocess_utils import rich_transcription_postprocess
+    except ImportError:
+        _die("未安装 funasr/torch，SenseVoice 引擎不可用。请运行：pip install funasr torch torchaudio"
+             "（或改用 --engine whisper）", 3)
+    print("[asr] 加载 SenseVoiceSmall + fsmn-vad（CPU）……首次会从 ModelScope 下载，请耐心等待",
+          file=sys.stderr)
+    model = AutoModel(model="iic/SenseVoiceSmall", vad_model="fsmn-vad",
+                      vad_kwargs={"max_single_segment_time": 30000},
+                      device=a.device, disable_update=True)
+    # language 支持 auto/zh/yue/en/ja/ko；whisper 的 ISO 码大体兼容，直接透传
+    language = None if a.language in (None, "", "auto") else a.language
+    res = model.generate(input=str(audio), cache={},
+                         language=language or "auto", use_itn=True,
+                         batch_size_s=60, merge_vad=True, merge_length_s=15)
+    if not res or not isinstance(res[0].get("text"), str):
+        _die("SenseVoice 未返回文本（可能是静音/损坏音频）", 3)
+    return rich_transcription_postprocess(res[0]["text"]).strip()
+
+
 def cmd_transcribe(a) -> int:
     src = _require_input(a.input)
     is_video = src.suffix.lower() in _VIDEO_EXT
@@ -355,11 +391,23 @@ def cmd_transcribe(a) -> int:
             tmp_audio = _extract_audio(src)
             audio = tmp_audio
 
+        # 引擎分发：SenseVoice 无词级时间戳，只支持 txt；字幕类输出走 whisper 分支
+        if getattr(a, "engine", "whisper") == "sensevoice":
+            if a.format != "txt":
+                _die("SenseVoice 引擎无词级时间戳，仅支持 --format txt；srt/ass/json 请用 --engine whisper", 2)
+            text = _transcribe_sensevoice(audio, a)
+            if not text:
+                print("[asr] 警告：未识别到任何语音内容（可能是静音或纯音乐）。", file=sys.stderr)
+            out = _prep_out(a.output) if a.output else _prep_out(f"outputs/{src.stem}/{src.stem}.txt")
+            out.write_text(text, encoding="utf-8")
+            kb = out.stat().st_size / 1024
+            print(f"✅ {out} ({kb:.1f} KB, 引擎=sensevoice)")
+            return 0
+
         cues, meta = _transcribe_audio(audio, a)
         if not cues:
             print("[asr] 警告：未识别到任何语音内容（可能是静音或纯音乐）。",
                   file=sys.stderr)
-
         fmt = a.format
         if fmt == "srt":
             content = _render_srt(cues, a.max_line_chars)
@@ -399,7 +447,10 @@ def cmd_transcribe(a) -> int:
 
 
 def cmd_info(a) -> int:
-    print("可用模型（--model，越大越准越慢，CPU 建议 base/small）：")
+    print("引擎（--engine）：")
+    print("  - whisper     faster-whisper，带词级时间戳，支持 srt/ass/txt/json")
+    print("  - sensevoice  中文口播更准更快，仅 txt（转写库默认引擎）；模型走 ModelScope 直连")
+    print("\nwhisper 可用模型（--model，越大越准越慢，CPU 建议 base/small）：")
     for m in _MODELS:
         tag = "（默认）" if m == "base" else ""
         print(f"  - {m}{tag}")
@@ -409,8 +460,8 @@ def cmd_info(a) -> int:
     print("\n输出格式（--format）：srt（默认）/ ass / txt / json")
     print("\nCPU 友好参数：--device cpu --compute-type int8")
     print("每行字数：--max-line-chars（中文默认 18，超长自动断行/拆条）")
-    print("\n模型下载走 HuggingFace，需外网代理；脚本会自动注入默认代理，")
-    print("也可先 export https_proxy=... http_proxy=... 覆盖。")
+    print("\nwhisper 模型下载走 HuggingFace，需外网代理；脚本会自动注入默认代理，")
+    print("也可先 export https_proxy=... http_proxy=... 覆盖。sensevoice 走 ModelScope 国内直连。")
     return 0
 
 
@@ -464,10 +515,12 @@ def _add_transcribe_args(p) -> None:
     p.add_argument("-i", "--input", required=True, help="音频或视频文件路径")
     p.add_argument("-o", "--output",
                    help="输出路径（默认 outputs/<输入文件名>/<输入文件名>.<format>）")
+    p.add_argument("--engine", choices=["whisper", "sensevoice"], default="whisper",
+                   help="识别引擎：whisper（带时间戳，字幕用）/ sensevoice（中文更准更快，仅 txt）。默认 whisper")
     p.add_argument("--format", choices=["srt", "ass", "txt", "json"],
                    default="srt", help="输出格式（默认 srt）")
     p.add_argument("--model", default="base",
-                   help=f"模型 {'/'.join(_MODELS)}（默认 base）")
+                   help=f"whisper 模型 {'/'.join(_MODELS)}（默认 base；sensevoice 引擎忽略此项）")
     p.add_argument("--language", default="auto",
                    help="语言码如 zh/en，默认 auto 自动检测")
     p.add_argument("--device", default="cpu", help="cpu / cuda（默认 cpu）")
