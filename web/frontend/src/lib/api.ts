@@ -239,21 +239,64 @@ export function resolveRssRoute(platform: string, blogger: string): Promise<{ fe
 }
 
 // ---- 视频文字转写（做内容链路：视频源 → 本地 whisper 转文字 → 随选题进对话） ----
-// 后端按 aweme_id 缓存（成功永久、失败 24h），ok=false 时调用方静默回落仅标题。
+// 后端按视频 id 缓存（抖音 aweme_id / B站 bvid；成功永久、失败 24h），ok=false 时调用方静默回落仅标题。
 export interface TranscriptResult {
   ok: boolean; cached: boolean; text: string; duration?: number | null;
   error: string; path?: string;
 }
-export function ensureTranscript(url: string): Promise<TranscriptResult> {
+export function ensureTranscript(url: string, title?: string): Promise<TranscriptResult> {
   return request('/api/transcribe', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ url }),
+    body: JSON.stringify({ url, title }),
   });
 }
-/** 抖音视频页链接才算「值得转写的视频源」；热搜/图文/RSS 条目都不发请求 */
+/** 视频页链接才算「值得转写的视频源」；热搜/图文/RSS 纯文本条目都不发请求 */
 export function isDouyinVideoUrl(url?: string): boolean {
   return !!url && /douyin\.com\/video\/\d{6,}/.test(url);
+}
+export function isBiliVideoUrl(url?: string): boolean {
+  return !!url && /bilibili\.com\/video\/BV[0-9A-Za-z]{8,}/.test(url);
+}
+export function isVideoSourceUrl(url?: string): boolean {
+  return isDouyinVideoUrl(url) || isBiliVideoUrl(url);
+}
+/** 视频源链接里的唯一 id（抖音 aweme_id / B站 bvid），与后端转写缓存键同源 */
+export function videoIdOf(url?: string): string | null {
+  const m = url?.match(/douyin\.com\/video\/(\d{6,})/);
+  if (m) return m[1];
+  const b = url?.match(/bilibili\.com\/video\/(BV[0-9A-Za-z]{8,})/);
+  return b ? b[1] : null;
+}
+
+// ---- 转写库（内容库「视频转写」分区）：列表给摘要（300 字），详情给全文 ----
+export type TranscriptState = 'running' | 'interrupted' | 'error' | 'ok';
+export interface TranscriptItem {
+  id: string; url: string; title: string; platform: string;
+  state: TranscriptState;
+  duration?: number | null; model?: string; error: string; updated: number;
+  summary: string; text?: string;
+}
+export function fetchTranscripts(): Promise<{ items: TranscriptItem[]; total: number }> {
+  return request('/api/transcripts');
+}
+export function fetchTranscript(id: string): Promise<TranscriptItem> {
+  return request(`/api/transcripts/${encodeURIComponent(id)}`);
+}
+
+// ---- LLM 额度（顶栏）：智谱 Coding Plan 的 5 小时窗口 + 周额度 ----
+// 与 ZCode/智谱控制台同源接口（/api/monitor/usage/quota/limit），后端 60s 缓存。
+export interface QuotaWindow {
+  key: string; label: string;
+  used: number; total: number; remaining: number;
+  usedPct: number; resetAt?: number | null;
+}
+export interface LlmQuota {
+  supported: boolean; reason?: string; error?: string;
+  level?: string; windows: QuotaWindow[];
+}
+export function fetchLlmQuota(): Promise<LlmQuota> {
+  return request('/api/llm/quota');
 }
 
 // ---- 内容排期 ----

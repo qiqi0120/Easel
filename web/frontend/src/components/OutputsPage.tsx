@@ -1,9 +1,18 @@
 import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import type { CSSProperties } from 'react';
-import { fetchOutputs, fetchOutputContent, mediaUrl, deleteOutput } from '../lib/api';
-import type { OutputNode, OutputMeta } from '../lib/api';
+import { fetchOutputs, fetchOutputContent, mediaUrl, deleteOutput,
+         fetchTranscripts, fetchTranscript, ensureTranscript } from '../lib/api';
+import type { OutputNode, OutputMeta, TranscriptItem, TranscriptState } from '../lib/api';
 import { renderMarkdown } from '../lib/sanitize';
 import { IconOutputs, IconImage, IconVideo, IconMusic, IconFile, IconFolder, IconRefresh, IconChevron, IconTrash } from './icons';
+
+// 转写展示态（与后端 _transcript_state 对齐）：interrupted=占位超时（服务重启过），可重试
+const T_STATE: Record<TranscriptState, { label: string; color: string }> = {
+  running: { label: '转写中', color: '#d97706' },
+  interrupted: { label: '已中断', color: '#dc2626' },
+  error: { label: '失败', color: '#dc2626' },
+  ok: { label: '已转写', color: '#16a34a' },
+};
 
 const FILTERS: { key: string; label: string }[] = [
   { key: 'all', label: '全部' },
@@ -77,9 +86,11 @@ interface OutputsPageProps {
   /** 从对话跳转进来的目录（outputs 相对路径，不含 outputs/ 前缀）；消费后由父层清空 */
   jumpPath?: string;
   onJumpHandled?: () => void;
+  /** 「带原文去对话」：复用 App.handleUseTopic（后端按视频 id 缓存，已转的秒回） */
+  onUseTopic?: (title: string, videoUrl?: string) => void | Promise<void>;
 }
 
-export default function OutputsPage({ jumpPath, onJumpHandled }: OutputsPageProps) {
+export default function OutputsPage({ jumpPath, onJumpHandled, onUseTopic }: OutputsPageProps) {
   const [roots, setRoots] = useState<OutputNode[]>([]);
   const [treeError, setTreeError] = useState('');
   const [stack, setStack] = useState<string[]>([]);   // 当前所在的文件夹名称路径
@@ -89,11 +100,55 @@ export default function OutputsPage({ jumpPath, onJumpHandled }: OutputsPageProp
   const [loading, setLoading] = useState(false);
   const reqSeq = useRef(0);
 
+  // ---- 视频转写分区：列表 + 详情全文 + 转写中轮询 ----
+  const [transcripts, setTranscripts] = useState<TranscriptItem[]>([]);
+  const [selT, setSelT] = useState<TranscriptItem | null>(null);
+  const [full, setFull] = useState('');
+  const [fullLoading, setFullLoading] = useState(false);
+  const [copyOk, setCopyOk] = useState(false);
+  const [retryBusy, setRetryBusy] = useState(false);
+  const tSeq = useRef(0);
+
+  const loadTranscripts = useCallback(() => {
+    // 失败静默成空列表：转写分区是锦上添花，别让它的接口问题打断内容库主视图
+    fetchTranscripts().then((d) => setTranscripts(d.items)).catch(() => setTranscripts([]));
+  }, []);
+
   const load = useCallback(() => {
     setTreeError('');
     fetchOutputs().then(setRoots).catch(() => setTreeError('加载产物列表失败'));
-  }, []);
+    loadTranscripts();
+  }, [loadTranscripts]);
   useEffect(() => { load(); }, [load]);
+
+  // 转写中条目 5s 轮询：running 占位被覆盖后，卡片自动变「已转写」
+  const hasRunning = transcripts.some((t) => t.state === 'running');
+  useEffect(() => {
+    if (!hasRunning) return;
+    const iv = setInterval(loadTranscripts, 5000);
+    return () => clearInterval(iv);
+  }, [hasRunning, loadTranscripts]);
+
+  const openTranscript = useCallback((t: TranscriptItem) => {
+    setSelT(t); setFull(''); setCopyOk(false);
+    if (t.state !== 'ok') return;   // 未成功条目没有全文可拉（失败给错误、running 给等待）
+    const seq = ++tSeq.current;
+    setFullLoading(true);
+    fetchTranscript(t.id)
+      .then((d) => { if (tSeq.current === seq) setFull(d.text || ''); })
+      .catch(() => { if (tSeq.current === seq) setFull(''); })
+      .finally(() => { if (tSeq.current === seq) setFullLoading(false); });
+  }, []);
+
+  // 抽屉开着时条目状态翻转（转写完成/失败）：同步卡片态，完成则顺手拉全文
+  useEffect(() => {
+    if (!selT) return;
+    const cur = transcripts.find((x) => x.id === selT.id);
+    if (cur && cur.state !== selT.state) {
+      setSelT(cur);
+      if (cur.state === 'ok') openTranscript(cur);
+    }
+  }, [transcripts, selT, openTranscript]);
 
   // 对话里的目录路径跳转：展开到对应层级（路径失效时 resolvePath 自动停在能到的层）
   useEffect(() => {
@@ -158,6 +213,39 @@ export default function OutputsPage({ jumpPath, onJumpHandled }: OutputsPageProp
     }
   }, []);
 
+  // ---- 转写分区：格式化与动作 ----
+  const fmtDur = (s?: number | null) =>
+    s ? (s >= 60 ? `${Math.floor(s / 60)} 分 ${Math.round(s % 60)} 秒` : `${Math.round(s)} 秒`) : '';
+  // 平台时间统一东八区展示；toLocaleString 跟随系统时区，本机即 +08:00
+  const fmtTime = (ts: number) =>
+    ts ? new Date(ts * 1000).toLocaleString('zh-CN',
+      { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false }) : '';
+
+  const copyFull = async () => {
+    try {
+      await navigator.clipboard.writeText(full);
+      setCopyOk(true);
+      setTimeout(() => setCopyOk(false), 1500);
+    } catch { /* 剪贴板被拒：静默，用户可在正文里手动选文 */ }
+  };
+
+  const downloadTxt = () => {
+    if (!selT) return;
+    const blob = new Blob([full], { type: 'text/plain;charset=utf-8' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `${(selT.title || selT.id).replace(/[\\/:*?"<>|]/g, '_').slice(0, 50)}.txt`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  };
+
+  const retryTranscript = async (t: TranscriptItem, e: React.MouseEvent) => {
+    e.stopPropagation();
+    setRetryBusy(true);
+    try { await ensureTranscript(t.url, t.title); } catch { /* 接口异常：下次再试 */ }
+    finally { setRetryBusy(false); loadTranscripts(); }
+  };
+
   const preview = () => {
     if (!selected) return null;
     const url = mediaUrl(selected.path);
@@ -219,6 +307,29 @@ export default function OutputsPage({ jumpPath, onJumpHandled }: OutputsPageProp
     </div>
   );
 
+  /** 转写卡片：标题（无标题回退摘要/ID）+ 平台/状态徽标 + 时长与时间 */
+  const renderTranscript = (t: TranscriptItem) => {
+    const st = T_STATE[t.state];
+    return (
+      <div key={t.id} className="card card-hover gcard" onClick={() => openTranscript(t)}>
+        <div className="gcard-thumb">
+          <span className="gcard-kind">{t.platform === 'bilibili' ? 'B站' : '抖音'}转写</span>
+          <div className="gcard-ph"><IconFile size={34} /></div>
+        </div>
+        <div className="gcard-meta">
+          <div className="gcard-name" title={t.title || t.summary}>
+            {t.title || (t.summary ? t.summary.slice(0, 26) : t.id)}
+          </div>
+          <div className="gcard-sub" style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
+            <span style={{ ...badge, background: `${st.color}22`, color: st.color }}>{st.label}</span>
+            {t.duration ? <span>{fmtDur(t.duration)}</span> : null}
+            <span>{fmtTime(t.updated)}</span>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
   const empty = dirs.length === 0 && files.length === 0;
 
   return (
@@ -267,7 +378,17 @@ export default function OutputsPage({ jumpPath, onJumpHandled }: OutputsPageProp
         </div>
       )}
 
-      {empty && !treeError ? (
+      {/* 视频转写库（只在根目录层级展示）：做内容链路转写的原文在这里回看/复制/带原文分析 */}
+      {atTop && transcripts.length > 0 && (
+        <>
+          <div className="section-label" style={{ margin: '18px 0 8px', fontSize: 13, fontWeight: 600, color: 'var(--text-secondary)' }}>
+            视频转写 · {transcripts.length}
+          </div>
+          <div className="gallery-grid">{transcripts.map(renderTranscript)}</div>
+        </>
+      )}
+
+      {empty && !treeError && transcripts.length === 0 ? (
         <div className="empty-state" style={{ height: 300 }}>
           <div className="empty-icon"><IconOutputs size={44} /></div>
           <p>{atTop ? '还没有产物——去对话或技能库生成第一条内容吧' : '这个文件夹是空的'}</p>
@@ -316,6 +437,63 @@ export default function OutputsPage({ jumpPath, onJumpHandled }: OutputsPageProp
             <div className="drawer-body">{preview()}</div>
             <div style={{ padding: '10px 16px', borderTop: '1px solid var(--border)', display: 'flex', justifyContent: 'flex-end' }}>
               <button className="btn btn-sm btn-danger" onClick={(e) => remove(selected, e)}><IconTrash size={13} /> 删除此文件</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {selT && (
+        <div className="drawer-overlay" onClick={() => setSelT(null)}>
+          <div className="drawer" onClick={(e) => e.stopPropagation()}>
+            <div className="drawer-header" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+              <div style={{ minWidth: 0 }}>
+                <div className="skill-detail-title" style={{ fontSize: 16 }}>
+                  {selT.title || (selT.summary ? selT.summary.slice(0, 30) : selT.id)}
+                </div>
+                <div style={{ fontSize: 12, color: 'var(--text-tertiary)', marginTop: 3 }}>
+                  {selT.platform === 'bilibili' ? 'B站' : '抖音'}视频
+                  {selT.duration ? ` · ${fmtDur(selT.duration)}` : ''}
+                  {` · ${fmtTime(selT.updated)}`}{selT.model ? ` · ${selT.model}` : ''}
+                </div>
+              </div>
+              <button className="icon-btn" onClick={() => setSelT(null)}>×</button>
+            </div>
+            <div className="drawer-body">
+              {selT.state === 'running' && (
+                <div className="loading"><div className="spinner" />转写中，完成后这里自动出全文……</div>
+              )}
+              {selT.state === 'interrupted' && (
+                <div className="notice-error" style={{ marginBottom: 10 }}>转写中断（服务重启过）——点下方「重试转写」。</div>
+              )}
+              {selT.state === 'error' && (
+                <div className="notice-error" style={{ marginBottom: 10 }}>{selT.error || '转写失败'}——可点下方「重试转写」。</div>
+              )}
+              {fullLoading ? (
+                <div className="loading"><div className="spinner" />加载中…</div>
+              ) : full ? (
+                /* 转写是纯文本，保留换行直排，不走 markdown 渲染（避免特殊符号被误格式化） */
+                <div style={{ whiteSpace: 'pre-wrap', fontSize: 14, lineHeight: 1.8 }}>{full}</div>
+              ) : null}
+              <div style={{ marginTop: 10 }}>
+                <a href={selT.url} target="_blank" rel="noreferrer" style={{ color: 'var(--accent-start)', fontSize: 13 }}>查看原视频 ↗</a>
+              </div>
+            </div>
+            <div style={{ padding: '10px 16px', borderTop: '1px solid var(--border)', display: 'flex', gap: 8, justifyContent: 'flex-end', flexWrap: 'wrap' }}>
+              {(selT.state === 'error' || selT.state === 'interrupted') && (
+                <button className="btn btn-sm" disabled={retryBusy} onClick={(e) => retryTranscript(selT, e)}>
+                  {retryBusy ? '重试中…' : '重试转写'}
+                </button>
+              )}
+              {selT.state === 'ok' && (
+                <>
+                  <button className="btn btn-sm" onClick={copyFull}>{copyOk ? '已复制 ✓' : '复制全文'}</button>
+                  <button className="btn btn-sm" onClick={downloadTxt}>下载 TXT</button>
+                </>
+              )}
+              <button className="btn btn-sm" disabled={!onUseTopic}
+                onClick={() => { onUseTopic?.(selT.title || (selT.summary ? selT.summary.slice(0, 40) : '这条视频'), selT.url); setSelT(null); }}>
+                带原文去对话
+              </button>
             </div>
           </div>
         </div>

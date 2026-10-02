@@ -4733,16 +4733,22 @@ async def api_watchlist_rss_route(req: RssRouteRequest):
 
 # ---- 视频文字转写（热点「做内容」链路：视频源 → 本地 whisper 转文字 → 随选题进对话） ----
 # 背景：「做内容」此前只把标题传给 agent，视频里实际说了什么全靠 agent 猜。这里在
-# 薄壳侧做确定性转写（不进 agent）：douyin_watch download 登录态下载视频 → asr.py
-# （faster-whisper，模型缓存在 ~/.cache/easel-models）转 txt → 结果按 aweme_id 落盘
-# outputs/_transcripts/（_ 前缀天然受删除保护、不进内容库）。成功缓存永久有效，
-# 失败（图文帖/风控/超长）也缓存 TRANSCRIPT_ERROR_TTL，避免每次点击都白跑一次浏览器。
-# 设计取舍见 docs/superpowers/specs/2026-10-02-douyin-video-transcript-design.md。
+# 薄壳侧做确定性转写（不进 agent）：抖音走 douyin_watch download 登录态下载、B站走
+# bili_download.py（yt-dlp）下音轨 → 统一经 asr.py（faster-whisper，模型缓存在
+# ~/.cache/easel-models）转 txt → 结果按视频 id 落盘 outputs/_transcripts/（_ 前缀天然
+# 受删除保护、不进内容库）。成功缓存永久有效，失败（图文帖/风控/超长）也缓存
+# TRANSCRIPT_ERROR_TTL，避免每次点击都白跑一次浏览器。转写全文在内容库「视频转写」
+# 分区可见（/api/transcripts），也随选题拼进对话。设计取舍见
+# docs/superpowers/specs/2026-10-02-douyin-video-transcript-design.md。
 _ASR_SCRIPT = SKILLS_DIR / "shared" / "scripts" / "asr.py"
+BILI_DOWNLOAD_SCRIPT = SKILLS_DIR / "shared" / "scripts" / "bili_download.py"
 DOUYIN_VIDEO_RE = re.compile(r"douyin\.com/video/(\d{6,})")
+BILI_VIDEO_RE = re.compile(r"bilibili\.com/video/(BV[0-9A-Za-z]{8,})")
 TRANSCRIPT_DIR = OUTPUTS_DIR / "_transcripts"
 TRANSCRIPT_ERROR_TTL = 24 * 3600     # 失败条目 24h 内不重试
 TRANSCRIPT_MAX_SECONDS = 15 * 60     # 时长上限：控制 ASR 子进程耗时与同步请求上限
+TRANSCRIPT_RUNNING_STALE = 30 * 60   # running 占位超时视为已中断（进程重启会留下死占位，不自动清、展示层判）
+TRANSCRIPT_SUMMARY_CHARS = 300       # 列表接口的文本摘要长度，全文走详情接口
 _TRANSCRIBE_LOCK = threading.Lock()  # 转写要起无头浏览器 + whisper，全局串行（同 _DEEP_RUN_LOCK 理由）
 
 
@@ -4767,19 +4773,83 @@ def _transcript_read(aweme_id: str) -> dict | None:
 
 
 def _transcript_write(aweme_id: str, url: str, *, text: str = "", duration: int | None = None,
-                      error: str = "", model: str = "") -> dict:
-    """写缓存（tmp+replace 原子写，同 _deep_write 模式）。成功与失败同构，ok 字段区分。"""
+                      error: str = "", model: str = "", title: str = "",
+                      running: bool = False) -> dict:
+    """写缓存（tmp+replace 原子写，同 _deep_write 模式）。成功与失败同构，ok 字段区分；
+    running=True 写「转写中」占位（ok=None），完成/失败后由同键整写覆盖。
+    title 是条目标题（雷达/收藏行上现成的）：落盘进转写库供内容库展示，不带就空。"""
     TRANSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
-    rec = {"id": aweme_id, "url": url, "ok": bool(text.strip()), "text": text,
-           "duration": duration, "model": model, "error": error, "updated": time.time()}
+    rec = {"id": aweme_id, "url": url, "title": (title or "").strip(),
+           "ok": (None if running else bool(text.strip())), "running": running,
+           "text": text, "duration": duration, "model": model, "error": error,
+           "updated": time.time()}
     tmp = _transcript_file(aweme_id).with_suffix(".json.tmp")
     tmp.write_text(json.dumps(rec, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(_transcript_file(aweme_id))
     return rec
 
 
+def _transcript_patch_title(vid: str, title: str) -> None:
+    """老缓存缺标题时补写（前端现在才把标题带过来的历史原因）。只动 title 字段，
+    整文件原子替换——与 _TRANSCRIBE_LOCK 下的转写整写并发时最坏被覆盖回无标题，
+    下次点击还会再补，可接受。读失败（损坏/已删）静默放弃，不影响主流程。"""
+    f = _transcript_file(vid)
+    try:
+        rec = json.loads(f.read_text(encoding="utf-8"))
+        rec["title"] = (title or "").strip()
+        tmp = f.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(rec, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(f)
+    except (OSError, ValueError):
+        pass
+
+
+def _transcript_platform(vid: str) -> str:
+    """转写键即平台标识：B站 bvid 是 BV 开头字母数字，抖音 aweme_id 是纯数字，天然不冲突。"""
+    return "bilibili" if vid.startswith("BV") else "douyin"
+
+
+def _transcript_state(rec: dict, now: float | None = None) -> str:
+    """展示态（内容库转写分区用）：running（转写中）/ interrupted（占位超时=进程
+    中断过，可重试）/ error / ok。不回写文件——重启留下的死占位等用户重试时自然覆盖。"""
+    now = now or time.time()
+    if rec.get("running") and rec.get("ok") is None and not rec.get("error"):
+        return "interrupted" if now - (rec.get("updated") or 0) > TRANSCRIPT_RUNNING_STALE else "running"
+    return "ok" if rec.get("ok") else "error"
+
+
+def _run_asr(media: Path, txt: Path) -> dict:
+    """asr.py 子进程：音频/视频文件 → 文本（须持 _TRANSCRIBE_LOCK 调用）。
+
+    引擎由 EASEL_ASR_ENGINE 选（sensevoice/whisper，默认 sensevoice）：SenseVoice
+    中文口播更准更快、模型走 ModelScope 国内直连已预下载；whisper 兜底（funasr
+    环境坏时 .env 里 EASEL_ASR_ENGINE=whisper 即可切回，base 模型同样本地缓存）。
+    视频后缀由脚本内部 ffmpeg 抽音轨。env 沿 _proxy_env——下载侧直连由各脚本
+    自保（bili_download._direct_env / douyin_watch --no-proxy-server），模型侧
+    两引擎均已本地缓存，运行时零外网依赖。"""
+    engine = os.environ.get("EASEL_ASR_ENGINE", "sensevoice").strip().lower()
+    if engine not in ("sensevoice", "whisper"):
+        engine = "sensevoice"
+    asr_cmd = [_script_python(), str(_ASR_SCRIPT), "transcribe", "-i", str(media),
+               "--format", "txt", "-o", str(txt), "--engine", engine]
+    try:
+        proc = subprocess.run(asr_cmd, capture_output=True, text=True, encoding="utf-8",
+                              errors="replace", timeout=1200,
+                              cwd=str(PROJECT_ROOT), env=_proxy_env())
+    except (OSError, subprocess.SubprocessError):
+        return {"error": "语音转写失败——本机执行环境异常，请稍后重试"}
+    if proc.returncode != 0:
+        tail = "；".join((proc.stderr or "").strip().splitlines()[-3:])
+        return {"error": f"语音转写失败：{tail or '稍后重试'}"}
+    text = txt.read_text(encoding="utf-8").strip() if txt.is_file() else ""
+    if not text:
+        return {"error": "未识别到语音内容（可能是纯音乐/无解说画面）"}
+    return {"text": text,
+            "model": ("SenseVoiceSmall" if engine == "sensevoice" else "faster-whisper-base")}
+
+
 def _transcribe_douyin(url: str) -> dict:
-    """转写执行体（须持 _TRANSCRIBE_LOCK 调用）：登录态下载视频 → asr.py → 文本。
+    """抖音转写执行体（须持 _TRANSCRIBE_LOCK 调用）：登录态下载视频 → asr.py → 文本。
 
     返回 {"text","duration","model"} 或 {"error"}。子进程必须用项目 .venv 解释器
     （playwright/faster-whisper 都装在那，见 _script_python）；env 沿 _proxy_env——
@@ -4810,27 +4880,70 @@ def _transcribe_douyin(url: str) -> dict:
         duration = int(ms / 1000) if isinstance(ms, (int, float)) and ms > 0 else None
         if duration and duration > TRANSCRIPT_MAX_SECONDS:
             return {"error": f"视频约 {duration // 60} 分钟，超过 {TRANSCRIPT_MAX_SECONDS // 60} 分钟暂不支持自动转写"}
-        asr_cmd = [_script_python(), str(_ASR_SCRIPT), "transcribe", "-i", str(video),
-                   "--format", "txt", "-o", str(txt)]
-        try:
-            proc2 = subprocess.run(asr_cmd, capture_output=True, text=True, encoding="utf-8",
-                                   errors="replace", timeout=1200,
-                                   cwd=str(PROJECT_ROOT), env=_proxy_env())
-        except (OSError, subprocess.SubprocessError):
-            return {"error": "语音转写失败——本机执行环境异常，请稍后重试"}
-        if proc2.returncode != 0:
-            tail = "；".join((proc2.stderr or "").strip().splitlines()[-3:])
-            return {"error": f"语音转写失败：{tail or '稍后重试'}"}
-        text = txt.read_text(encoding="utf-8").strip() if txt.is_file() else ""
-        if not text:
-            return {"error": "未识别到语音内容（可能是纯音乐/无解说画面）"}
-        return {"text": text, "duration": duration, "model": "faster-whisper-base"}
+        out = _run_asr(video, txt)
+        if "error" in out:
+            return out
+        return {"text": out["text"], "duration": duration, "model": out["model"]}
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def _transcribe_bili(url: str) -> dict:
+    """B站转写执行体（须持 _TRANSCRIBE_LOCK）：yt-dlp 下载音轨 → asr.py → 文本。
+
+    不起登录态浏览器——B站视频页有稳定公开 API，yt-dlp 内置提取器连 wbi 签名都
+    替我们做了；bili_login 产出的 cookies.json 有则带上降风控，没有也常能取到音频轨
+    （转写不挑音质，还避开大会员清晰度墙）。退出码语义见 bili_download.py 头注释。"""
+    tmpdir = Path(tempfile.mkdtemp(prefix="easel-transcribe-"))
+    txt = tmpdir / "transcript.txt"
+    try:
+        cmd = [_script_python(), str(BILI_DOWNLOAD_SCRIPT), "download", "--url", url,
+               "-o", str(tmpdir / "audio.%(ext)s"), "--timeout", "60"]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
+                                  errors="replace", timeout=300,
+                                  cwd=str(PROJECT_ROOT), env=_proxy_env())
+        except (OSError, subprocess.SubprocessError):
+            return {"error": "下载音频失败——本机执行环境异常，请稍后重试"}
+        if proc.returncode == 3:
+            return {"error": "B站下载被拒——请先在「账号」页登录B站再试（或该视频有权限限制）"}
+        if proc.returncode == 6:
+            return {"error": "B站下载超时——稍后重试"}
+        if proc.returncode != 0:
+            return {"error": "B站视频下载失败——可能被风控拦截，稍后重试"}
+        try:
+            meta = json.loads(proc.stdout)
+        except ValueError:
+            return {"error": "下载结果解析失败——稍后重试"}
+        ms = meta.get("duration_ms")
+        duration = int(ms / 1000) if isinstance(ms, (int, float)) and ms > 0 else None
+        if duration and duration > TRANSCRIPT_MAX_SECONDS:
+            return {"error": f"视频约 {duration // 60} 分钟，超过 {TRANSCRIPT_MAX_SECONDS // 60} 分钟暂不支持自动转写"}
+        # 落盘名 audio.<ext>（ext 由实际格式定，bestaudio 不可用时可能是视频），排除 info.json 找媒体
+        media = next((p for p in tmpdir.glob("audio.*")
+                      if p.suffix.lower() not in (".json", ".part")), None)
+        if not media:
+            return {"error": "音频文件缺失——稍后重试"}
+        out = _run_asr(media, txt)
+        if "error" in out:
+            return out
+        return {"text": out["text"], "duration": duration, "model": out["model"]}
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _transcribe_video(url: str) -> dict:
+    """转写执行体入口（须持 _TRANSCRIBE_LOCK）：按链接形态分发到对应平台的下载器。
+    B站与抖音共用同一缓存目录 / TTL / 时长上限，仅下载链路不同。函数名走模块全局
+    查找（而非闭包引用），测试 monkeypatch _transcribe_douyin/_transcribe_bili 才能生效。"""
+    if BILI_VIDEO_RE.search(url or ""):
+        return _transcribe_bili(url)
+    return _transcribe_douyin(url)
+
+
 class TranscribeRequest(BaseModel):
     url: str
+    title: str | None = None   # 条目标题（雷达/收藏行上现成）：落盘进转写库供内容库展示
 
 
 def _transcript_response(rec: dict, cached: bool) -> dict:
@@ -4842,31 +4955,177 @@ def _transcript_response(rec: dict, cached: bool) -> dict:
 
 @app.post("/api/transcribe")
 async def api_transcribe(req: TranscribeRequest):
-    """把抖音视频的语音转成文字（做内容链路）。结果按 aweme_id 缓存，命中即时返回。
+    """把抖音/B站视频的语音转成文字（做内容链路）。结果按视频 id 缓存，命中即时返回。
 
     失败返回 200 + ok=false（沿「200+error 字段不算请求失败」约定），前端静默回落
     仅标题，不阻断创作；仅非法链接 400。同步等待：一两分钟的视频全程几十秒
-    （下载 ~15s + 本地 base/int8 转写 ≈ 数秒到数十秒），转写过的直接走缓存。"""
+    （下载 ~15s + 本地 base/int8 转写 ≈ 数秒到数十秒），转写过的直接走缓存。
+    未命中先落 running 占位再进 executor：内容库「视频转写」分区立刻能看到这条在跑；
+    executor 线程独立于请求存活，关页面/断流也会跑完落盘。"""
+    vid = None
     m = DOUYIN_VIDEO_RE.search(req.url or "")
-    if not m:
-        raise HTTPException(400, "仅支持抖音视频链接（douyin.com/video/<id>）")
-    aweme_id = m.group(1)
-    hit = _transcript_read(aweme_id)
+    if m:
+        vid = m.group(1)
+    else:
+        m = BILI_VIDEO_RE.search(req.url or "")
+        if m:
+            vid = m.group(1)
+    if not vid:
+        raise HTTPException(400, "仅支持抖音/B站视频链接（douyin.com/video/<id>、bilibili.com/video/BVxxx）")
+    title = (req.title or "").strip()
+    hit = _transcript_read(vid)
     if hit:
+        if title and not (hit.get("title") or "").strip():
+            _transcript_patch_title(vid, title)   # 老缓存没存标题，这次带上了就补（不重转）
         return _transcript_response(hit, cached=True)
 
     def _work() -> dict:
         with _TRANSCRIBE_LOCK:
-            again = _transcript_read(aweme_id)   # 双检：等锁期间可能已被并发请求转好
+            again = _transcript_read(vid)   # 双检：等锁期间可能已被并发请求转好
             if again:
                 return _transcript_response(again, cached=True)
-            out = _transcribe_douyin(req.url)
-            rec = _transcript_write(aweme_id, req.url, text=out.get("text", ""),
+            out = _transcribe_video(req.url)
+            rec = _transcript_write(vid, req.url, title=title, text=out.get("text", ""),
                                     duration=out.get("duration"),
                                     error=out.get("error", ""), model=out.get("model", ""))
             return _transcript_response(rec, cached=False)
 
+    _transcript_write(vid, req.url, title=title, running=True)
     return await asyncio.get_event_loop().run_in_executor(None, _work)
+
+
+@app.get("/api/transcripts")
+async def api_transcripts():
+    """转写库列表（内容库「视频转写」分区）：按转写时间倒序，text 只给摘要（全文走详情）。"""
+    items: list[dict] = []
+    if TRANSCRIPT_DIR.is_dir():
+        now = time.time()
+        for f in TRANSCRIPT_DIR.glob("*.json"):
+            try:
+                rec = json.loads(f.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue   # 原子写途中崩溃的残片：跳过即可，别让整个列表 500
+            if not isinstance(rec, dict) or not rec.get("id"):
+                continue
+            text = rec.get("text") or ""
+            items.append({
+                "id": rec["id"], "url": rec.get("url") or "",
+                "title": (rec.get("title") or "").strip(),
+                "platform": _transcript_platform(rec["id"]),
+                "state": _transcript_state(rec, now),
+                "duration": rec.get("duration"), "model": rec.get("model") or "",
+                "error": rec.get("error") or "", "updated": rec.get("updated") or 0,
+                "summary": text[:TRANSCRIPT_SUMMARY_CHARS],
+            })
+    items.sort(key=lambda d: d["updated"], reverse=True)
+    return {"items": items, "total": len(items)}
+
+
+@app.get("/api/transcripts/{vid}")
+async def api_transcript_detail(vid: str):
+    """单条转写全文（内容库 drawer 查看/复制/下载用）。id 白名单校验防路径穿越。"""
+    if not re.fullmatch(r"(BV[0-9A-Za-z]{8,}|\d{6,})", vid or ""):
+        raise HTTPException(400, "非法转写 ID")
+    try:
+        rec = json.loads(_transcript_file(vid).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        raise HTTPException(404, "转写记录不存在")
+    return {
+        "id": rec["id"], "url": rec.get("url") or "",
+        "title": (rec.get("title") or "").strip(),
+        "platform": _transcript_platform(rec["id"]),
+        "state": _transcript_state(rec),
+        "duration": rec.get("duration"), "model": rec.get("model") or "",
+        "error": rec.get("error") or "", "updated": rec.get("updated") or 0,
+        "text": rec.get("text") or "",
+    }
+
+
+# ---- LLM 额度（顶栏显示）：智谱 Coding Plan 的 5 小时窗口 + 周额度 ----
+# 获取方式同 ZCode / 智谱控制台：GET {origin}/api/monitor/usage/quota/limit，
+# Authorization 直接放 API key（这条接口历史上不带 Bearer 前缀）。仅对智谱系
+# 部署（open.bigmodel.cn / api.z.ai）生效；其他 provider 返回 supported=false，
+# 前端据此整体隐藏额度条。额度变化慢，60s 进程内缓存足够，切页不重复打接口。
+_QUOTA_HOSTS = {"open.bigmodel.cn", "api.z.ai"}
+_QUOTA_TTL = 60
+_QUOTA_CACHE: dict = {}
+
+
+def _quota_windows(limits: list) -> list[dict]:
+    """limits[] → 顶栏窗口列表。unit/number 明确标注窗口：3×5=5 小时、6×1=周；
+    字段语义 usage=窗口总额度、currentValue=已用。unit 语义若变，退回「按序取
+    前两个」（第一个当 5 小时、第二个当周），与社区脚本的兼容做法一致。"""
+    windows = []
+    for it in limits or []:
+        if not isinstance(it, dict) or it.get("type") != "CREDIT_LIMIT":
+            continue
+        unit, number = it.get("unit"), it.get("number")
+        if unit == 3 and number == 5:
+            key, label = "five_hour", "5 小时"
+        elif unit == 6:
+            key, label = "weekly", "本周"
+        else:
+            continue
+        total, used = it.get("usage") or 0, it.get("currentValue") or 0
+        pct = (used / total * 100) if total else float(it.get("percentage") or 0)
+        windows.append({"key": key, "label": label, "used": used, "total": total,
+                        "remaining": it.get("remaining") or 0,
+                        "usedPct": round(pct, 1), "resetAt": it.get("nextResetTime")})
+    if not windows:
+        for i, it in enumerate([x for x in (limits or [])
+                                if isinstance(x, dict) and x.get("percentage") is not None][:2]):
+            key, label = ("five_hour", "5 小时") if i == 0 else ("weekly", "本周")
+            windows.append({"key": key, "label": label, "used": it.get("currentValue") or 0,
+                            "total": it.get("usage") or 0, "remaining": it.get("remaining") or 0,
+                            "usedPct": float(it.get("percentage") or 0),
+                            "resetAt": it.get("nextResetTime")})
+    return windows
+
+
+@app.get("/api/llm/quota")
+async def api_llm_quota():
+    """顶栏 LLM 额度：5 小时窗口 + 本周的已用/剩余/重置时间。
+
+    失败返回 200 + error（前端显示为不可用）；成功缓存 _QUOTA_TTL，失败不缓存
+    ——下次请求立即重试，用户刷新页面就能看到恢复。"""
+    now = time.time()
+    hit = _QUOTA_CACHE.get("data")
+    if hit and now - _QUOTA_CACHE.get("at", 0) < _QUOTA_TTL:
+        return hit
+    env = _read_env()
+    token = (env.get("ANTHROPIC_AUTH_TOKEN") or os.environ.get("ANTHROPIC_AUTH_TOKEN") or "").strip()
+    base = (env.get("ANTHROPIC_BASE_URL") or os.environ.get("ANTHROPIC_BASE_URL") or "").strip()
+    if not token or not base:
+        return {"supported": False, "reason": "未配置模型服务（.env 缺 token / base_url）"}
+    host = (urllib.parse.urlparse(base).hostname or "").lower()
+    if host not in _QUOTA_HOSTS:
+        return {"supported": False, "reason": f"非智谱系端点（{host or base}），无额度接口"}
+    origin = f"{urllib.parse.urlparse(base).scheme}://{host}"
+
+    def _fetch() -> dict:
+        url = f"{origin}/api/monitor/usage/quota/limit"
+        req = urllib.request.Request(url, headers={"Authorization": token,
+                                                   "Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        if not payload.get("success"):
+            raise ValueError(payload.get("msg") or "接口返回失败")
+        data = payload.get("data") or {}
+        return {"supported": True, "level": data.get("level") or "",
+                "windows": _quota_windows(data.get("limits"))}
+
+    try:
+        result = await asyncio.get_event_loop().run_in_executor(None, _fetch)
+    except urllib.error.HTTPError as e:
+        try:
+            detail = json.loads(e.read().decode("utf-8")).get("msg") or ""
+        except Exception:   # noqa: BLE001——响应体不是 JSON 就退回状态行
+            detail = ""
+        return {"supported": True, "error": f"额度查询失败：{detail or e}"}
+    except Exception as e:  # noqa: BLE001
+        return {"supported": True, "error": f"额度查询失败：{e}"}
+    _QUOTA_CACHE["data"], _QUOTA_CACHE["at"] = result, now
+    return result
 
 
 SCHEDULE_FILE = OUTPUTS_DIR / "_schedule.json"

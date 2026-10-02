@@ -1473,3 +1473,20 @@ textarea.field { resize: vertical; min-height: 90px; }
 .settings-overlay .model-cell input.mock { min-width: 0; flex: 1 1 auto; }
 .settings-overlay .model-cell .adv-btn { flex: 0 0 auto; }
 
+
+/* ===== 顶栏 LLM 额度条（QuotaBar）：5 小时窗口 + 本周，来自智谱 Coding Plan 用量接口 ===== */
+.quota-bar {
+  display: flex; align-items: center; gap: 16px;
+  padding: 7px 20px; border-bottom: 1px solid var(--border);
+  background: var(--surface-2);
+}
+.quota-pill { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--text-secondary); }
+.quota-label { font-weight: 600; color: var(--text); }
+.quota-track { width: 88px; height: 5px; border-radius: 999px; background: var(--surface-hover); overflow: hidden; }
+.quota-fill { height: 100%; border-radius: 999px; transition: width 0.4s ease; }
+.quota-pct { min-width: 36px; font-variant-numeric: tabular-nums; }
+.quota-reset { color: var(--text-tertiary); }
+.quota-level {
+  margin-left: auto; font-size: 11px; color: var(--text-tertiary);
+  border: 1px solid var(--border); border-radius: 999px; padding: 1px 9px;
+}

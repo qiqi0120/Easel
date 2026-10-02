@@ -22,6 +22,13 @@ interface TrendRowProps {
   busy?: boolean;
   /** 标题允许折两行（博主/收藏有正文摘要，热搜榜单行更利落） */
   clamp?: boolean;
+  /** 视频条目（抖音/B站视频链接）：按钮组切成「转文字 →（已转写才出现）做内容」 */
+  video?: boolean;
+  /** 该视频已转写成功（转写库里有 ok 记录）——没转之前不显示「做内容」 */
+  transcribed?: boolean;
+  /** 这条正在转写（转文字按钮显示忙态） */
+  transcribeBusy?: boolean;
+  onTranscribe?: () => void;
 }
 
 const fmtDate = (d: string) => (d ? d.slice(0, 16).replace('T', ' ') : '');
@@ -33,11 +40,12 @@ function fmtHot(v: string): string {
   return n >= 100000000 ? `${(n / 100000000).toFixed(1)}亿` : `${(n / 10000).toFixed(1)}万`;
 }
 
-/** 三种数据源共用的行：排名 / 封面 / 标题 / 来源标 + 收藏 / 做内容 */
+/** 三种数据源共用的行：排名 / 封面 / 标题 / 来源标 + 收藏 / 做内容 / 转文字 */
 export default function TrendRow(props: TrendRowProps) {
   const {
     index, title, url, hot, cover, date, summary,
     sourceLabel, sourceColor, hotTrailing, saved, onSave, onUse, busy, clamp,
+    video, transcribed, transcribeBusy, onTranscribe,
   } = props;
   return (
     <div className="trend-item">
@@ -69,14 +77,29 @@ export default function TrendRow(props: TrendRowProps) {
       >
         {saved ? <IconCheck size={14} /> : <IconBookmark size={14} />}
       </button>
-      <button
-        className="trend-use"
-        title={busy ? '正在转写视频语音（首次需下载本地模型，会慢一些）' : '做成内容'}
-        onClick={onUse}
-        disabled={busy}
-      >
-        {busy ? (url ? '转写中…' : '准备中…') : '做内容'}
-      </button>
+      {/* 视频条目没转写成功前不显示「做内容」——做了内容 agent 就该拿着原文干活，
+          与其点了才发现没转写（静默回落只凭标题猜），不如先引导把文字拿到手 */}
+      {(!video || transcribed) && (
+        <button
+          className="trend-use"
+          title={busy ? '正在准备内容' : '做成内容'}
+          onClick={onUse}
+          disabled={busy}
+        >
+          {busy ? '准备中…' : '做内容'}
+        </button>
+      )}
+      {video && (
+        <button
+          className="trend-use"
+          title={transcribeBusy ? '本地模型转写中，请稍候…'
+            : transcribed ? '已转写完成——原文在内容库「视频转写」，再点一次秒回' : '把视频里的语音转成文字（本地模型，首次较慢）'}
+          onClick={onTranscribe}
+          disabled={transcribeBusy}
+        >
+          {transcribeBusy ? '转写中…' : transcribed ? '已转文字' : '转文字'}
+        </button>
+      )}
     </div>
   );
 }

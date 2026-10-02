@@ -13,9 +13,10 @@ import IdeasPage from './components/IdeasPage';
 import PublishPage from './components/PublishPage';
 import BreakdownPage from './components/BreakdownPage';
 import SubNav from './components/SubNav';
+import QuotaBar from './components/QuotaBar';
 import OnboardingWizard from './components/OnboardingWizard';
 import SettingsPanel from './components/SettingsPanel';
-import { fetchStatus, fetchPersonas, streamChat, fetchLastTurn, stopChat, ensureTranscript, isDouyinVideoUrl } from './lib/api';
+import { fetchStatus, fetchPersonas, streamChat, fetchLastTurn, stopChat, ensureTranscript, isVideoSourceUrl } from './lib/api';
 import type { PersonaItem, UploadedFile, ChatQuestion } from './lib/api';
 import { questionStatus } from './lib/api';
 import { deleteSession as deleteRemoteSession } from './lib/api';
@@ -519,14 +520,15 @@ export default function App() {
   }, [sendUserAndStream]);
 
   // 热点「一键做成内容」：新开会话，把选题作为指令发出去，跳到对话页。
-  // 内容源是抖音视频时先确保视频文字已转写（本地模型；后端按 aweme_id 缓存，
+  // 视频源（抖音/B站）先确保视频文字已转写（本地模型；后端按视频 id 缓存，
   // 已转过的直接复用），转写文本随选题一起交给 agent——否则 agent 只能凭标题猜。
+  // 标题一并传给后端落转写库（内容库「视频转写」分区展示用）。
   // 转写失败（图文/风控/未登录等）静默回落仅标题，不阻断创作。
   const handleUseTopic = useCallback(async (title: string, videoUrl?: string) => {
     let transcript = '';
-    if (videoUrl && isDouyinVideoUrl(videoUrl)) {
+    if (videoUrl && isVideoSourceUrl(videoUrl)) {
       try {
-        const t = await ensureTranscript(videoUrl);
+        const t = await ensureTranscript(videoUrl, title);
         if (t.ok && t.text) {
           // 超 6000 字截断进 prompt（转写全文在 path，agent 可自行读取）
           const body = t.text.length > 6000 ? `${t.text.slice(0, 6000)}……（后文截断）` : t.text;
@@ -749,7 +751,7 @@ export default function App() {
       case 'skills':
         return <SkillPage persona={selectedPersona} />;
       case 'outputs':
-        return <OutputsPage jumpPath={outputsJump} onJumpHandled={clearOutputsJump} />;
+        return <OutputsPage jumpPath={outputsJump} onJumpHandled={clearOutputsJump} onUseTopic={handleUseTopic} />;
       case 'accounts':
         return <AccountsPage />;
       case 'profile':
@@ -801,6 +803,7 @@ export default function App() {
         onOpenSettings={() => setSettingsOpen(true)}
       />
       <main className="main-content">
+        <QuotaBar />
         {(['trends', 'ideas', 'calendar', 'publish', 'breakdown'] as Page[]).includes(currentPage) && (
           <SubNav current={currentPage} onNavigate={setCurrentPage} />
         )}

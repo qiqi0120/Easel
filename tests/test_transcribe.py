@@ -106,3 +106,108 @@ def test_transcribe_pipeline_shape(tmp_transcripts, monkeypatch):
     out = asyncio.run(web.api_transcribe(web.TranscribeRequest(url=VIDEO_URL)))
     assert set(out) == {"ok", "cached", "text", "duration", "error", "path"}
     assert out["ok"] is False and out["text"] == "" and out["duration"] is None
+
+
+BILI_URL = "https://www.bilibili.com/video/BV1GJ411x7h7/"
+
+
+def test_transcribe_bili_dispatch_and_title(tmp_transcripts, monkeypatch):
+    """B站链接分发给 _transcribe_bili：按 bvid 落盘、标题入库；第二次命中缓存不重跑。"""
+    calls: list[str] = []
+
+    def fake_bili(url: str) -> dict:
+        calls.append(url)
+        return {"text": "B站视频里说的话", "duration": 30, "model": "faster-whisper-base"}
+
+    monkeypatch.setattr(web, "_transcribe_bili", fake_bili)
+    out1 = asyncio.run(web.api_transcribe(
+        web.TranscribeRequest(url=BILI_URL, title="测试视频")))
+    assert out1["ok"] is True and out1["cached"] is False
+    rec = json.loads((tmp_transcripts / "BV1GJ411x7h7.json").read_text(encoding="utf-8"))
+    assert rec["title"] == "测试视频"
+
+    out2 = asyncio.run(web.api_transcribe(web.TranscribeRequest(url=BILI_URL)))
+    assert out2["ok"] is True and out2["cached"] is True
+    assert calls == [BILI_URL]                    # 只跑过一次执行体
+
+
+def test_transcribe_title_patch_on_cached(tmp_transcripts, monkeypatch):
+    """老缓存缺标题、这次带上了：命中缓存路径顺手补写标题，不重跑执行体。"""
+    calls: list[str] = []
+
+    def fake_run(url: str) -> dict:
+        calls.append(url)
+        return {"text": "内容", "duration": 5, "model": "m"}
+
+    monkeypatch.setattr(web, "_transcribe_douyin", fake_run)
+    asyncio.run(web.api_transcribe(web.TranscribeRequest(url=VIDEO_URL)))
+    f = tmp_transcripts / "7300000000000000001.json"
+    rec = json.loads(f.read_text(encoding="utf-8"))
+    rec.pop("title", None)                        # 模拟老版本记录
+    f.write_text(json.dumps(rec, ensure_ascii=False), encoding="utf-8")
+
+    out = asyncio.run(web.api_transcribe(
+        web.TranscribeRequest(url=VIDEO_URL, title="新标题")))
+    assert out["cached"] is True and len(calls) == 1
+    assert json.loads(f.read_text(encoding="utf-8"))["title"] == "新标题"
+
+
+def test_transcribe_running_placeholder_and_stale(tmp_transcripts, monkeypatch):
+    """未命中先落 running 占位（执行体进锁时它已在盘上）；超时占位列表判 interrupted。"""
+    observed: list = []
+
+    def fake_run(url: str) -> dict:
+        rec = json.loads((tmp_transcripts / "7300000000000000001.json").read_text(encoding="utf-8"))
+        observed.append(rec.get("running"))       # 执行体运行中应能看到占位
+        return {"text": "好了", "duration": 3, "model": "m"}
+
+    monkeypatch.setattr(web, "_transcribe_douyin", fake_run)
+    out = asyncio.run(web.api_transcribe(web.TranscribeRequest(url=VIDEO_URL, title="T")))
+    assert out["ok"] is True and observed == [True]
+
+    # 进程重启留下的死占位：手写一条超时 running → 列表判 interrupted，完成条判 ok
+    web._transcript_write("999", VIDEO_URL, running=True)
+    f = tmp_transcripts / "999.json"
+    rec = json.loads(f.read_text(encoding="utf-8"))
+    rec["updated"] -= web.TRANSCRIPT_RUNNING_STALE + 1
+    f.write_text(json.dumps(rec, ensure_ascii=False), encoding="utf-8")
+    listing = asyncio.run(web.api_transcripts())
+    states = {it["id"]: it["state"] for it in listing["items"]}
+    assert states["999"] == "interrupted"
+    assert states["7300000000000000001"] == "ok"
+
+
+def test_transcript_list_and_detail(tmp_transcripts):
+    """列表按时间倒序、text 只给摘要；详情给全文；非法 id 400、缺失 404。"""
+    long_text = "字" * (web.TRANSCRIPT_SUMMARY_CHARS + 50)
+    web._transcript_write("1110001", VIDEO_URL, text=long_text, title="长文")
+    web._transcript_write("2220002", VIDEO_URL, text="短的")
+    # 时间戳微秒级也可能同秒，手动错开保证倒序断言稳定
+    f = tmp_transcripts / "2220002.json"
+    rec = json.loads(f.read_text(encoding="utf-8"))
+    rec["updated"] += 5
+    f.write_text(json.dumps(rec, ensure_ascii=False), encoding="utf-8")
+
+    listing = asyncio.run(web.api_transcripts())
+    assert listing["total"] == 2
+    assert [it["id"] for it in listing["items"]] == ["2220002", "1110001"]
+    assert "text" not in listing["items"][0]      # 列表不携带全文
+    long_item = next(it for it in listing["items"] if it["id"] == "1110001")
+    assert len(long_item["summary"]) == web.TRANSCRIPT_SUMMARY_CHARS
+
+    detail = asyncio.run(web.api_transcript_detail("1110001"))
+    assert detail["text"] == long_text and detail["title"] == "长文"
+    assert detail["platform"] == "douyin" and detail["state"] == "ok"
+
+    with pytest.raises(HTTPException) as e1:
+        asyncio.run(web.api_transcript_detail("9999999"))
+    assert e1.value.status_code == 404
+    with pytest.raises(HTTPException) as e2:
+        asyncio.run(web.api_transcript_detail("../etc"))
+    assert e2.value.status_code == 400
+
+
+def test_transcript_platform_key():
+    """转写键即平台：bvid 是 BV 开头，aweme_id 纯数字，天然不冲突。"""
+    assert web._transcript_platform("BV1GJ411x7h7") == "bilibili"
+    assert web._transcript_platform("7300000000000000001") == "douyin"

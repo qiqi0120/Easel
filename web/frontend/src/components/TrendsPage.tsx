@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { fetchTrends, createIdea, fetchWatchDigest, fetchDouyinCollect, loadDouyinCollectMore, loadBloggerMore } from '../lib/api';
+import { fetchTrends, createIdea, fetchWatchDigest, fetchDouyinCollect, loadDouyinCollectMore, loadBloggerMore,
+         fetchTranscripts, ensureTranscript, videoIdOf } from '../lib/api';
 import type { TrendItem, WatchDigestItem, WatchGroup } from '../lib/api';
 import { IconFire, IconRefresh, IconPlus } from './icons';
 import MediaTabs from './trends/MediaTabs';
@@ -87,6 +88,45 @@ export default function TrendsPage({ onUseTopic, onNavigate }: TrendsPageProps) 
       await createIdea({ title, source: sourceTag, status: 'pending' });
       setSaved((prev) => new Set(prev).add(title));
     } catch { /* ignore */ }
+  };
+
+  // ---- 视频转写态：视频条目「已转文字才出现做内容」的依据 ----
+  // 进页面拉一次转写库（本地接口，代价小），取 state=ok 的视频 id 集合；
+  // 点击「转文字」成功后本地补进集合，不整表重拉。
+  const [transcribed, setTranscribed] = useState<Set<string>>(new Set());
+  // 转文字忙态：记正在转写的视频 id（后端全局锁串行，同一时间本来就只有一条在跑）
+  const [transcribeBusy, setTranscribeBusy] = useState('');
+  useEffect(() => {
+    fetchTranscripts()
+      .then((d) => setTranscribed(new Set(d.items.filter((t) => t.state === 'ok').map((t) => t.id))))
+      .catch(() => { /* 转写库接口失败：全部按未转写处理，只影响按钮显隐 */ });
+  }, []);
+
+  // 「转文字」入口：显式触发本地转写，保存逻辑与做内容链路相同（同一 /api/transcribe）。
+  // 这是用户主动点的按钮，失败要给反馈——不同于做内容的静默回落仅标题。
+  const startTranscribe = async (title: string, url?: string) => {
+    const vid = videoIdOf(url);
+    if (!url || !vid || transcribeBusy) return;
+    setTranscribeBusy(vid);
+    try {
+      const t = await ensureTranscript(url, title);
+      if (t.ok) setTranscribed((prev) => new Set(prev).add(vid));
+      else alert(t.error || '转写失败，请稍后重试');
+    } catch (e) {
+      alert((e as Error).message || '转写失败，请稍后重试');
+    } finally {
+      setTranscribeBusy('');
+    }
+  };
+
+  // 三处 TrendRow 共用的视频转写 props：非视频链接（热搜词条/图文）返回空对象，行内不出「转文字」
+  const transcribeProps = (url?: string) => {
+    const vid = videoIdOf(url);
+    return !vid ? {} : {
+      video: true as const,
+      transcribed: transcribed.has(vid),
+      transcribeBusy: transcribeBusy === vid,
+    };
   };
 
   // 做内容入口统一走这里：同一时间只允许一条在准备（转写要起浏览器+本地模型），
@@ -321,6 +361,8 @@ export default function TrendsPage({ onUseTopic, onNavigate }: TrendsPageProps) 
                 onSave={() => save(it.title, `${def.label}热搜`)}
                 onUse={() => startUseTopic(it.title)}
                 busy={useBusy === it.title}
+                {...transcribeProps(it.url)}
+                onTranscribe={() => startTranscribe(it.title, it.url)}
               />
             ))}
           </div>
@@ -358,6 +400,8 @@ export default function TrendsPage({ onUseTopic, onNavigate }: TrendsPageProps) 
                   onSave={() => save(it.title, `博主:${g?.name ?? def.label}`)}
                   onUse={() => startUseTopic(g ? `${g.name}：「${it.title}」` : `博主：「${it.title}」`, it.url)}
                   busy={useBusy === it.title}
+                  {...transcribeProps(it.url)}
+                  onTranscribe={() => startTranscribe(it.title, it.url)}
                 />
               ))}
               {activeGroup?.platform === 'douyin' && mediaItems.length > 0 && (
@@ -402,6 +446,8 @@ export default function TrendsPage({ onUseTopic, onNavigate }: TrendsPageProps) 
                 onSave={() => save(it.title, '抖音收藏')}
                 onUse={() => startUseTopic(`抖音收藏：「${it.title}」`, it.url)}
                 busy={useBusy === it.title}
+                {...transcribeProps(it.url)}
+                onTranscribe={() => startTranscribe(it.title, it.url)}
               />
             ))}
             {collect.items.length > 0 && (
