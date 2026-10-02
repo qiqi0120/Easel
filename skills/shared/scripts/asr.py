@@ -262,6 +262,22 @@ def _render_json(cues: list[tuple[float, float, str]], meta: dict) -> str:
 
 
 # ── 转录核心 ──────────────────────────────────────────────────────────
+def _decode_audio_ffmpeg(path: Path):
+    """av 路线炸了时的兜底：ffmpeg 直接解到 16kHz 单声道 float32 PCM
+    （faster-whisper 的标准输入形态，np 数组进去就不再经过 av）。"""
+    import numpy as np
+    proc = subprocess.run(
+        ["ffmpeg", "-v", "error", "-i", str(path), "-vn",
+         "-ac", "1", "-ar", "16000", "-f", "f32le", "-"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    if proc.returncode != 0 or not proc.stdout:
+        tail = "\n".join((proc.stderr or "").decode("utf-8", "replace")
+                         .strip().splitlines()[-5:])
+        _die(f"ffmpeg 解码音频失败:\n{tail}", 3)
+    return np.frombuffer(proc.stdout, dtype=np.float32)
+
+
 def _transcribe_audio(audio: Path, a) -> tuple[list[tuple[float, float, str]], dict]:
     try:
         from faster_whisper import WhisperModel
@@ -287,12 +303,25 @@ def _transcribe_audio(audio: Path, a) -> tuple[list[tuple[float, float, str]], d
              f"（config.json/model.bin/tokenizer.json/vocabulary.txt）", 4)
 
     language = None if a.language in (None, "", "auto") else a.language
-    segments, tinfo = model.transcribe(
-        str(audio),
-        language=language,
-        vad_filter=True,
-        beam_size=a.beam_size,
-    )
+    try:
+        segments, tinfo = model.transcribe(
+            str(audio),
+            language=language,
+            vad_filter=True,
+            beam_size=a.beam_size,
+        )
+    except TypeError as e:
+        # 新版 PyAV（>=15）移除了 av.open 的 metadata_errors 参数，faster-whisper 的
+        # decode_audio 会直接 TypeError。改用 ffmpeg 自己解成 float32 数组喂进去，绕开 av。
+        if "metadata_errors" not in str(e):
+            raise
+        print("[asr] 检测到 PyAV 兼容性问题，改用 ffmpeg 直接解码音频……", file=sys.stderr)
+        segments, tinfo = model.transcribe(
+            _decode_audio_ffmpeg(audio),
+            language=language,
+            vad_filter=True,
+            beam_size=a.beam_size,
+        )
     detected = getattr(tinfo, "language", None)
     duration = getattr(tinfo, "duration", None)
     print(f"[asr] 检测语言={detected} 时长={duration}s，开始转录……", file=sys.stderr)

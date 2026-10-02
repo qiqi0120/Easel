@@ -923,6 +923,8 @@ textarea.field { resize: vertical; min-height: 90px; }
 .trend-use { opacity: 0; transition: all var(--t-fast); flex-shrink: 0; font-size: 12px; padding: 4px 9px; border-radius: 7px; border: 1px solid var(--border); background: var(--bg-elev); color: var(--accent-end); cursor: pointer; white-space: nowrap; }
 .trend-item:hover .trend-use { opacity: 1; }
 .trend-use:hover { background: var(--accent-soft); border-color: transparent; }
+/* 转写忙态：默认 hover 才显形，这里要常显（用户点完就移开了，得看得见「转写中…」） */
+.trend-use:disabled { opacity: 1; cursor: not-allowed; color: var(--text-tertiary); }
 .trend-empty { color: var(--text-tertiary); font-size: 13px; padding: 10px 12px; }
 /* 我的关注:缩略图 + 多行标题(抖音长文案) */
 .watch-cover { width: 56px; height: 74px; object-fit: cover; border-radius: 8px; flex-shrink: 0; background: var(--surface-hover); }
@@ -933,6 +935,10 @@ textarea.field { resize: vertical; min-height: 90px; }
 .trend-source { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; color: var(--text-secondary); }
 .trend-source i { width: 14px; height: 14px; border-radius: 4px; display: inline-block; flex-shrink: 0; }
 .trend-summary { font-size: 11.5px; color: var(--text-tertiary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-top: 1px; }
+/* 「加载更多」按需深翻入口（抖音源：博主作品/收藏） */
+.trend-loadmore { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 10px 12px 6px; }
+.trend-loadmore-hint { color: var(--text-tertiary); font-size: 12px; }
+.trend-loadmore-error { color: var(--red); font-size: 12px; }
 
 /* ---- 热点雷达三层导航：媒体 → 数据源 → 博主 ---- */
 .media-tabs {

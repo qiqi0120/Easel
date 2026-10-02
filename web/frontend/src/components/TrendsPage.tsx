@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { fetchTrends, createIdea, fetchWatchDigest, fetchDouyinCollect } from '../lib/api';
+import { fetchTrends, createIdea, fetchWatchDigest, fetchDouyinCollect, loadDouyinCollectMore, loadBloggerMore } from '../lib/api';
 import type { TrendItem, WatchDigestItem, WatchGroup } from '../lib/api';
 import { IconFire, IconRefresh, IconPlus } from './icons';
 import MediaTabs from './trends/MediaTabs';
@@ -12,7 +12,7 @@ import type { MediaKey, SourceKey } from './trends/mediaConfig';
 import type { Page } from './Sidebar';
 
 interface TrendsPageProps {
-  onUseTopic: (title: string) => void;   // 一键做成内容 → 跳 chat
+  onUseTopic: (title: string, videoUrl?: string) => void | Promise<void>;   // 一键做成内容 → 跳 chat（视频源先转写）
   onNavigate?: (page: Page) => void;      // 收藏未登录时引导去「账号」页
 }
 
@@ -43,10 +43,12 @@ function cacheWrite(key: string, data: unknown): void {
 
 interface HotPayload { items: TrendItem[]; updated: number }
 interface BlogPayload { groups: WatchGroup[]; updated: number }
-interface CollectPayload { items: WatchDigestItem[]; updated: number }
+interface CollectPayload { items: WatchDigestItem[]; updated: number; hasMore: boolean }
 
 export default function TrendsPage({ onUseTopic, onNavigate }: TrendsPageProps) {
   const [saved, setSaved] = useState<Set<string>>(new Set());
+  // 做内容忙态：记正在准备的那条标题（视频源要先转写，可能几十秒），按钮显示「转写中…」防连点
+  const [useBusy, setUseBusy] = useState('');
 
   // ---- 三层导航：媒体 → 数据源 → 博主 ----
   const [media, setMedia] = useState<MediaKey>(DEFAULT_MEDIA);
@@ -68,10 +70,16 @@ export default function TrendsPage({ onUseTopic, onNavigate }: TrendsPageProps) 
   const blogSeq = useRef(0);
 
   // ---- 我的收藏：只有抖音；首次点开才拉（起无头浏览器代价大，后端另有缓存） ----
-  const [collect, setCollect] = useState<CollectPayload>({ items: [], updated: 0 });
+  // hasMore=false=后端翻到过底；true/undefined=可能还有，显示「加载更多」入口
+  const [collect, setCollect] = useState<CollectPayload>({ items: [], updated: 0, hasMore: true });
   const [collectLoading, setCollectLoading] = useState(false);
   const [collectError, setCollectError] = useState('');
   const collectLoaded = useRef(false);
+  // ---- 按需深翻（「加载更多」）：抖音翻页要真实滚动，每次十几秒到一分钟，只由用户触发 ----
+  const [collectMoreLoading, setCollectMoreLoading] = useState(false);
+  const [collectMoreError, setCollectMoreError] = useState('');
+  const [blogMoreLoading, setBlogMoreLoading] = useState(false);
+  const [blogMoreError, setBlogMoreError] = useState('');
 
   const save = async (title: string, sourceTag: string) => {
     if (saved.has(title)) return;
@@ -79,6 +87,15 @@ export default function TrendsPage({ onUseTopic, onNavigate }: TrendsPageProps) 
       await createIdea({ title, source: sourceTag, status: 'pending' });
       setSaved((prev) => new Set(prev).add(title));
     } catch { /* ignore */ }
+  };
+
+  // 做内容入口统一走这里：同一时间只允许一条在准备（转写要起浏览器+本地模型），
+  // 期间该行按钮显示忙态；App.handleUseTopic 完成转写并跳转对话后忙态解除。
+  //（不叫 useTopic——oxlint 会把 use 开头的函数误判成 Hook）
+  const startUseTopic = async (title: string, videoUrl?: string) => {
+    if (useBusy) return;
+    setUseBusy(title);
+    try { await onUseTopic(title, videoUrl); } finally { setUseBusy(''); }
   };
 
   const loadHot = useCallback((pf: MediaKey, force = false) => {
@@ -142,14 +159,51 @@ export default function TrendsPage({ onUseTopic, onNavigate }: TrendsPageProps) 
     setCollectLoading(true);
     fetchDouyinCollect(refresh)
       .then((d) => {
-        setCollect({ items: d.items, updated: d.updated });
+        setCollect({ items: d.items, updated: d.updated, hasMore: d.has_more !== false });
         setCollectError(d.error);   // 后端 200 + error 字段（未登录/风控），不算请求失败
         // 只缓存成功结果：失败（如未登录）不缓存，下次进来自动重试，登录后能自愈
-        if (!d.error) cacheWrite('collect', { items: d.items, updated: d.updated });
+        if (!d.error) cacheWrite('collect', { items: d.items, updated: d.updated, hasMore: d.has_more !== false });
       })
       .catch(() => setCollectError('收藏拉取失败——请稍后重试。'))
       .finally(() => setCollectLoading(false));
   }, []);
+
+  // 收藏「加载更多」：相对已加载集合增量深翻，结果含全量（后端深度缓存 ∪ 本次新增）
+  const loadCollectMore = useCallback(async () => {
+    setCollectMoreLoading(true);
+    setCollectMoreError('');
+    try {
+      const d = await loadDouyinCollectMore();
+      if (d.error) { setCollectMoreError(d.error); return; }
+      const next: CollectPayload = { items: d.items, updated: d.updated, hasMore: d.has_more };
+      setCollect(next);
+      cacheWrite('collect', next);
+    } catch {
+      setCollectMoreError('加载更多失败——请稍后重试。');
+    } finally {
+      setCollectMoreLoading(false);
+    }
+  }, []);
+
+  // 单个博主「加载更多」（仅抖音源；RSS 没有更早内容可翻）
+  const loadBlogMore = async (gid: string) => {
+    setBlogMoreLoading(true);
+    setBlogMoreError('');
+    try {
+      const d = await loadBloggerMore(gid);
+      if (d.error || !d.group) {
+        setBlogMoreError(d.error || '加载更多失败——请稍后重试');
+        return;
+      }
+      const next = groups.map((g) => (g.id === d.group!.id ? d.group! : g));
+      setGroups(next);
+      cacheWrite('blog', { groups: next, updated: blogUpdated });
+    } catch (e) {
+      setBlogMoreError(e instanceof Error ? e.message : '加载更多失败——请稍后重试');
+    } finally {
+      setBlogMoreLoading(false);
+    }
+  };
 
   // 博主 digest 是一次全平台共用的请求，挂载时就拉——否则一级 tab 的「已订阅」橙点
   // 和二级的条数徽标都会先显示 0。热搜与收藏仍按需懒加载。
@@ -173,7 +227,13 @@ export default function TrendsPage({ onUseTopic, onNavigate }: TrendsPageProps) 
     if (!groups.some((g) => g.id === blogger)) setBlogger(ALL_BLOGGERS);
   }, [groups, blogger]);
 
+  // 切博主时清掉上一个博主的深翻错误提示
+  useEffect(() => { setBlogMoreError(''); }, [blogger]);
+
   const mediaGroups = groups.filter((g) => g.platform === media);
+  const activeGroup = blogger === ALL_BLOGGERS
+    ? undefined
+    : mediaGroups.find((g) => g.id === blogger);
   const mediaItems = blogger === ALL_BLOGGERS
     ? mediaGroups.flatMap((g) => g.items.map((it) => ({ it, g })))
     : (mediaGroups.find((g) => g.id === blogger)?.items ?? []).map((it) => ({ it, g: undefined }));
@@ -259,7 +319,8 @@ export default function TrendsPage({ onUseTopic, onNavigate }: TrendsPageProps) 
                 hotTrailing
                 saved={saved.has(it.title)}
                 onSave={() => save(it.title, `${def.label}热搜`)}
-                onUse={() => onUseTopic(it.title)}
+                onUse={() => startUseTopic(it.title)}
+                busy={useBusy === it.title}
               />
             ))}
           </div>
@@ -295,9 +356,24 @@ export default function TrendsPage({ onUseTopic, onNavigate }: TrendsPageProps) 
                   clamp
                   saved={saved.has(it.title)}
                   onSave={() => save(it.title, `博主:${g?.name ?? def.label}`)}
-                  onUse={() => onUseTopic(g ? `${g.name}：「${it.title}」` : `博主：「${it.title}」`)}
+                  onUse={() => startUseTopic(g ? `${g.name}：「${it.title}」` : `博主：「${it.title}」`, it.url)}
+                  busy={useBusy === it.title}
                 />
               ))}
+              {activeGroup?.platform === 'douyin' && mediaItems.length > 0 && (
+                <LoadMore
+                  hasMore={activeGroup.hasMore !== false}
+                  loaded={activeGroup.items.length}
+                  loading={blogMoreLoading}
+                  error={blogMoreError}
+                  onLoad={() => loadBlogMore(activeGroup.id)}
+                />
+              )}
+              {blogger === ALL_BLOGGERS && mediaGroups.some((g) => g.platform === 'douyin') && mediaItems.length > 0 && (
+                <div className="trend-loadmore">
+                  <span className="trend-loadmore-hint">在上方博主栏选择单个博主，可按需加载更早的内容</span>
+                </div>
+              )}
             </div>
           </div>
         </div>
@@ -324,9 +400,19 @@ export default function TrendsPage({ onUseTopic, onNavigate }: TrendsPageProps) 
                 clamp
                 saved={saved.has(it.title)}
                 onSave={() => save(it.title, '抖音收藏')}
-                onUse={() => onUseTopic(`抖音收藏：「${it.title}」`)}
+                onUse={() => startUseTopic(`抖音收藏：「${it.title}」`, it.url)}
+                busy={useBusy === it.title}
               />
             ))}
+            {collect.items.length > 0 && (
+              <LoadMore
+                hasMore={collect.hasMore}
+                loaded={collect.items.length}
+                loading={collectMoreLoading}
+                error={collectMoreError}
+                onLoad={loadCollectMore}
+              />
+            )}
           </div>
         </div>
       )}
@@ -350,4 +436,29 @@ function mediaWithGroups(groups: WatchGroup[]): Set<MediaKey> {
     if (known.has(g.platform as MediaKey)) out.add(g.platform as MediaKey);
   }
   return out;
+}
+
+// 「加载更多」按需深翻入口：抖音翻页要真实滚动触发，每次十几秒到一分钟，
+// 提示里把代价讲清楚，避免用户以为是普通分页点了没反应
+function LoadMore({ hasMore, loaded, loading, error, onLoad }: {
+  hasMore: boolean; loaded: number; loading: boolean; error: string; onLoad: () => void;
+}) {
+  if (!hasMore) {
+    return (
+      <div className="trend-loadmore">
+        <span className="trend-loadmore-hint">已到底，没有更多了（共 {loaded} 条）</span>
+      </div>
+    );
+  }
+  return (
+    <div className="trend-loadmore">
+      <button className="btn btn-sm" onClick={onLoad} disabled={loading}>
+        {loading ? '正在加载…' : '加载更多'}
+      </button>
+      <span className="trend-loadmore-hint">
+        已加载 {loaded} 条 · 每次约 +15 条，需滚动翻页（十几秒到一分钟）
+      </span>
+      {error && <span className="trend-loadmore-error">{error}</span>}
+    </div>
+  );
 }

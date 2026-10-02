@@ -181,7 +181,10 @@ export interface WatchEntry {
   note: string; enabled: boolean; added_at: number;
 }
 export interface WatchDigestItem { title: string; url: string; date: string; summary: string; cover?: string; }
-export interface WatchGroup { id: string; name: string; platform: string; items: WatchDigestItem[]; }
+// 博主统计（粉丝数/作品数）：抖音源打开主页时顺带抓到才有的值，拿不到为 null
+export interface BloggerStats { follower_count?: number; aweme_count?: number; }
+// hasMore 仅抖音源有值（true/undefined=可能还有，false=已到底）；RSS 源没有翻页概念
+export interface WatchGroup { id: string; name: string; platform: string; items: WatchDigestItem[]; hasMore?: boolean; stats?: BloggerStats | null; }
 
 export function fetchWatchlist(): Promise<WatchEntry[]> {
   return request('/api/watchlist');
@@ -206,9 +209,26 @@ export function deleteWatchlist(id: string): Promise<{ ok: boolean; deleted: str
 export function fetchWatchDigest(): Promise<{ groups: WatchGroup[]; updated: number }> {
   return request('/api/watchlist/digest');
 }
-// 当前抖音账号的收藏视频（登录态抓取）；error 非空=未登录/风控等，items 此时为空
-export function fetchDouyinCollect(refresh = false): Promise<{ items: WatchDigestItem[]; error: string; updated: number }> {
+// 当前抖音账号的收藏视频（登录态抓取）；error 非空=未登录/风控等。
+// 返回「已加载全量」= 深度缓存 ∪ 最新一屏；has_more=false 表示已到底（后端翻到过底）
+export function fetchDouyinCollect(refresh = false): Promise<{ items: WatchDigestItem[]; error: string; updated: number; has_more?: boolean }> {
   return request(`/api/watchlist/collect${refresh ? '?refresh=1' : ''}`);
+}
+// 「加载更多」：相对已加载集合增量深翻（无头浏览器滚动翻页，约十几秒到一分钟）。
+// 抖音的翻页只能真实滚动触发，代价随深度线性增长，所以按需分批而不是一次拿全
+export function loadDouyinCollectMore(want = 15): Promise<{ items: WatchDigestItem[]; error: string; updated: number; has_more: boolean }> {
+  return request('/api/watchlist/collect/load', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ want }),
+  });
+}
+export function loadBloggerMore(id: string, want = 15): Promise<{ error: string; group: WatchGroup | null; has_more?: boolean }> {
+  return request('/api/watchlist/blog/load', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id, want }),
+  });
 }
 export function resolveRssRoute(platform: string, blogger: string): Promise<{ feed_url: string }> {
   return request('/api/watchlist/rss-route', {
@@ -216,6 +236,24 @@ export function resolveRssRoute(platform: string, blogger: string): Promise<{ fe
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ platform, blogger }),
   });
+}
+
+// ---- 视频文字转写（做内容链路：视频源 → 本地 whisper 转文字 → 随选题进对话） ----
+// 后端按 aweme_id 缓存（成功永久、失败 24h），ok=false 时调用方静默回落仅标题。
+export interface TranscriptResult {
+  ok: boolean; cached: boolean; text: string; duration?: number | null;
+  error: string; path?: string;
+}
+export function ensureTranscript(url: string): Promise<TranscriptResult> {
+  return request('/api/transcribe', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ url }),
+  });
+}
+/** 抖音视频页链接才算「值得转写的视频源」；热搜/图文/RSS 条目都不发请求 */
+export function isDouyinVideoUrl(url?: string): boolean {
+  return !!url && /douyin\.com\/video\/\d{6,}/.test(url);
 }
 
 // ---- 内容排期 ----

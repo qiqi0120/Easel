@@ -15,7 +15,7 @@ import BreakdownPage from './components/BreakdownPage';
 import SubNav from './components/SubNav';
 import OnboardingWizard from './components/OnboardingWizard';
 import SettingsPanel from './components/SettingsPanel';
-import { fetchStatus, fetchPersonas, streamChat, fetchLastTurn, stopChat } from './lib/api';
+import { fetchStatus, fetchPersonas, streamChat, fetchLastTurn, stopChat, ensureTranscript, isDouyinVideoUrl } from './lib/api';
 import type { PersonaItem, UploadedFile, ChatQuestion } from './lib/api';
 import { questionStatus } from './lib/api';
 import { deleteSession as deleteRemoteSession } from './lib/api';
@@ -519,8 +519,25 @@ export default function App() {
   }, [sendUserAndStream]);
 
   // 热点「一键做成内容」：新开会话，把选题作为指令发出去，跳到对话页。
-  const handleUseTopic = useCallback((title: string) => {
-    const prompt = `围绕当前热点「${title}」：先判断它适不适合我的账号赛道；若合适，给 2-3 个差异化的二创角度，并把你最推荐的那条写成可直接发布的文案初稿。`;
+  // 内容源是抖音视频时先确保视频文字已转写（本地模型；后端按 aweme_id 缓存，
+  // 已转过的直接复用），转写文本随选题一起交给 agent——否则 agent 只能凭标题猜。
+  // 转写失败（图文/风控/未登录等）静默回落仅标题，不阻断创作。
+  const handleUseTopic = useCallback(async (title: string, videoUrl?: string) => {
+    let transcript = '';
+    if (videoUrl && isDouyinVideoUrl(videoUrl)) {
+      try {
+        const t = await ensureTranscript(videoUrl);
+        if (t.ok && t.text) {
+          // 超 6000 字截断进 prompt（转写全文在 path，agent 可自行读取）
+          const body = t.text.length > 6000 ? `${t.text.slice(0, 6000)}……（后文截断）` : t.text;
+          const dur = t.duration
+            ? `（时长约 ${t.duration >= 60 ? `${Math.floor(t.duration / 60)} 分 ${t.duration % 60} 秒` : `${t.duration} 秒`}）`
+            : '';
+          transcript = `\n\n这条热点的原视频文字转写${dur}（本地模型识别的语音，请结合视频实际内容判断与创作）：\n${body}\n（转写全文存于 ${t.path}，需要完整版可自行读取）`;
+        }
+      } catch { /* 接口异常：退回仅标题 */ }
+    }
+    const prompt = `围绕当前热点「${title}」：先判断它适不适合我的账号赛道；若合适，给 2-3 个差异化的二创角度，并把你最推荐的那条写成可直接发布的文案初稿。${transcript}`;
     const ns = createSession(selectedPersona || undefined);
     setSessions((prev) => { const u = [ns, ...prev]; saveSessions(u); return u; });
     setActiveSessionId(ns.id);

@@ -15,6 +15,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -3092,6 +3093,7 @@ async def api_media(path: str):
 
 # 系统数据目录/文件——不允许从内容库删除（删了会丢登录态/日历/发布记录）
 PROTECTED_OUTPUTS = {"_login", "_analytics", "_schedule.json", "_ideas.json", "_watchlist.json",
+                     "_watch_deep.json",
                      "_publish", "_publish.log", "_sessions", "_profile_build", "_debug", "_inbox"}
 UPLOAD_EXTS = IMAGE_EXTS | VIDEO_EXTS | {
     ".pdf", ".txt", ".md", ".markdown", ".csv", ".json", ".srt", ".vtt",
@@ -4251,10 +4253,163 @@ def _douyin_uid_from_feed(feed_url: str) -> str:
     return m.group(1) if m else ""
 
 
-def _fetch_douyin_source(uid: str) -> list[dict]:
+# ---- 抖音深度加载（「加载更多」按需翻页） ----
+# 面板默认每源只给最新一屏（WATCHLIST_MAX_PER_SOURCE，一屏够用）；更早的内容不预取，
+# 由用户点「加载更多」触发 douyin_watch --want/--seen-file 增量深翻（滚动翻页，代价随
+# 深度线性增长，博主 100 条也要分好几批拿）。已拿回的条目持久化在 _watch_deep.json：
+# 既是按 id 去重的存储，也是下次深翻的 seen 水位——页面刷新/服务重启不缩回第一屏，
+# 也不重复翻已看过的页。只对抖音源开放：RSS/Atom 本身没有「更早内容」可翻。
+WATCH_DEEP_FILE = OUTPUTS_DIR / "_watch_deep.json"
+WATCH_DEEP_BATCH = 15                       # 每次「加载更多」的目标增量（与首屏一致）
+_DEEP_RUN_LOCK = threading.Lock()           # 深翻要起无头浏览器，全局串行防并发多开
+_DEEP_STORE_LOCK = threading.Lock()         # _watch_deep.json 读改写临界段（深翻/常规拉取共用文件）
+
+
+def _deep_read() -> dict:
+    if not WATCH_DEEP_FILE.is_file():
+        return {"sources": {}}
+    try:
+        d = json.loads(WATCH_DEEP_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {"sources": {}}
+    return d if isinstance(d, dict) and isinstance(d.get("sources"), dict) else {"sources": {}}
+
+
+def _deep_write(d: dict) -> None:
+    OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = WATCH_DEEP_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(WATCH_DEEP_FILE)
+
+
+def _deep_entry(sources: dict, key: str) -> dict:
+    """取源条目，缺省补位。has_more 未知时按「还有」给入口——宁可多给一次按钮，
+    也不能让用户在还有内容时就看不到加载入口。"""
+    entry = sources.get(key)
+    if not isinstance(entry, dict) or not isinstance(entry.get("items"), list):
+        entry = {"items": [], "updated": 0, "has_more": True}
+        sources[key] = entry
+    return entry
+
+
+def _deep_get(key: str) -> dict:
+    with _DEEP_STORE_LOCK:
+        return _deep_entry(_deep_read()["sources"], key)
+
+
+def _deep_upsert(key: str, fresh: list[dict] | None = None,
+                 has_more: bool | None = None, stats: dict | None = None) -> dict:
+    """合并 fresh 进源条目并写回（原子段）；fresh/has_more/stats 都没给则只读不写。
+
+    stats（粉丝数/作品数）非空才更新——抓取失败/接口没发时保留旧值，别把已知的抹了。"""
+    with _DEEP_STORE_LOCK:
+        store = _deep_read()
+        entry = _deep_entry(store["sources"], key)
+        dirty = False
+        if fresh:
+            entry["items"] = _deep_merge(entry["items"], fresh)
+            entry["updated"] = time.time()
+            dirty = True
+        if has_more is not None:
+            entry["has_more"] = has_more
+            dirty = True
+        if stats:
+            entry["stats"] = dict(stats)
+            dirty = True
+        if dirty:
+            _deep_write(store)
+        return entry
+
+
+def _deep_merge(old: list[dict], new: list[dict]) -> list[dict]:
+    """条目按 id 去重合并、按时间倒序（ISO 同区时序可直接比，无时间的排最后）。"""
+    by_id: dict[str, dict] = {}
+    for it in [*old, *new]:
+        iid = it.get("id") or it.get("url") or it.get("title", "")
+        if iid and iid not in by_id:
+            by_id[iid] = it
+    return sorted(by_id.values(), key=lambda it: it.get("date") or "", reverse=True)
+
+
+def _aweme_id(url: str) -> str:
+    """https://www.douyin.com/video/<id> → <id>（与 douyin_watch.py 的已看集合口径一致）。"""
+    return (url or "").rstrip("/").rsplit("/", 1)[-1]
+
+
+def _douyin_display_item(it: dict, with_author: bool) -> dict:
+    """脚本归一化条目 → 面板展示条目（id 附带，供深度缓存去重与 seen 水位）。"""
+    parts = []
+    if with_author and it.get("author"):
+        parts.append(f"作者 {it['author']}")
+    parts += [f"{k} {v}" for k, v in
+              (("赞", it.get("digg")), ("评", it.get("comment"))) if v is not None]
+    url = it.get("url", "")
+    return {"title": it.get("title", ""), "url": url, "date": it.get("created", ""),
+            "summary": " · ".join(parts), "cover": it.get("cover", ""),
+            "feed": "" if with_author else it.get("feed", ""), "id": _aweme_id(url)}
+
+
+def _douyin_deep_load(mode: str, uid: str = "", want: int = WATCH_DEEP_BATCH
+                      ) -> tuple[list[dict], str, bool]:
+    """「加载更多」执行体：douyin_watch --want/--seen-file 增量深翻，结果并入深度缓存。
+
+    mode="collect" 拉当前账号收藏；mode="blogger" 拉指定 uid 的博主作品。返回
+    (该源完整条目[展示形状], 错误提示, has_more)；出错时条目回落已存内容不空断。
+    深翻要起无头浏览器滚动翻页，第 N 页 ≈ N×2s + 一次浏览器启动，超时随已看深度放宽；
+    _DEEP_RUN_LOCK 全局串行（并发点两次就是开两个浏览器 + 水位互踩），抢不到锁直接报忙。
+    """
+    if not _DEEP_RUN_LOCK.acquire(blocking=False):
+        return [], "已有加载任务在进行中——等它完成再试", True
+    try:
+        skey = "collect" if mode == "collect" else f"douyin:{uid}"
+        entry = _deep_get(skey)
+        seen_ids = [it["id"] for it in entry["items"] if it.get("id")]
+        script_timeout = min(60 + len(seen_ids) * 2, 240)   # 深度水位越高，滚动越久
+        fd, seen_path = tempfile.mkstemp(suffix=".json")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as tf:
+                json.dump(seen_ids, tf, ensure_ascii=False)
+            sub = "collect" if mode == "collect" else "fetch"
+            cmd = [_script_python(), str(_DOUYIN_WATCH), sub,
+                   "--want", str(max(1, want)), "--seen-file", seen_path,
+                   "--timeout", str(script_timeout), "--format", "json"]
+            if mode == "blogger":
+                cmd += ["--uid", uid]
+            try:
+                proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
+                                      errors="replace", timeout=script_timeout + 30,
+                                      cwd=str(PROJECT_ROOT), env=_proxy_env())
+            except (OSError, subprocess.SubprocessError):
+                return (entry["items"], "加载更多失败——本机执行环境异常，请稍后重试",
+                        entry["has_more"])
+        finally:
+            Path(seen_path).unlink(missing_ok=True)
+        if proc.returncode == 8:
+            return (entry["items"], "抖音未登录——请先在「账号」页登录抖音，再回来刷新",
+                    entry["has_more"])
+        if proc.returncode != 0:
+            return (entry["items"], "加载更多超时（可能被风控拦截）——稍后重试", entry["has_more"])
+        try:
+            d = json.loads(proc.stdout)
+        except ValueError:
+            return (entry["items"], "加载结果解析失败——稍后重试", entry["has_more"])
+        raw = d.get("items") if isinstance(d, dict) else None
+        fresh = [_douyin_display_item(it, with_author=(mode == "collect"))
+                 for it in raw if isinstance(it, dict)] if isinstance(raw, list) else []
+        # 到底判定：服务端明确 has_more=false，或滚了一圈没有新增（软到底，再翻也是白跑）
+        done = d.get("has_more") is False or d.get("new_count") == 0
+        entry = _deep_upsert(skey, fresh, has_more=False if done else None)
+        return entry["items"], "", entry["has_more"]
+    finally:
+        _DEEP_RUN_LOCK.release()
+
+
+def _fetch_douyin_source(uid: str) -> tuple[list[dict], dict]:
     """登录态抓抖音博主最新作品（douyin_watch.py 旁听 aweme API）。
 
-    未登录/超时/风控 → 返回 []（脚本侧 exit 8/6），面板按「暂不可用」处理不报错。
+    返回 (条目, 博主统计)：统计是脚本打开主页时顺带旁听 profile/other XHR 得到的
+    粉丝数/作品数，零额外翻页代价；拿不到为 {}，前端不展示。
+    未登录/超时/风控 → ([], {})（脚本侧 exit 8/6），面板按「暂不可用」处理不报错。
     脚本内部 --no-proxy-server 直连，这里 env 走 _proxy_env() 仅透传常规变量。
     """
     cmd = [_script_python(), str(_DOUYIN_WATCH), "fetch", "--uid", uid,
@@ -4264,24 +4419,18 @@ def _fetch_douyin_source(uid: str) -> list[dict]:
                               errors="replace", timeout=90, cwd=str(PROJECT_ROOT),
                               env=_proxy_env())
     except (OSError, subprocess.SubprocessError):
-        return []
+        return [], {}
     if proc.returncode != 0:
-        return []
+        return [], {}
     try:
         d = json.loads(proc.stdout)
     except ValueError:
-        return []
+        return [], {}
     items = d.get("items") if isinstance(d, dict) else None
-    out = []
-    for it in items if isinstance(items, list) else []:
-        if not isinstance(it, dict):
-            continue
-        summary = " · ".join(f"{k} {v}" for k, v in
-                             (("赞", it.get("digg")), ("评", it.get("comment"))) if v is not None)
-        out.append({"title": it.get("title", ""), "link": it.get("url", ""),
-                    "summary": summary, "published": it.get("created", ""),
-                    "cover": it.get("cover", ""), "feed": it.get("feed", "")})
-    return out
+    out = [_douyin_display_item(it, with_author=False)
+           for it in items if isinstance(it, dict)] if isinstance(items, list) else []
+    stats = d.get("author_stats") if isinstance(d, dict) else None
+    return out, (stats if isinstance(stats, dict) else {})
 
 
 _COLLECT_CACHE_KEY = "__douyin_collect__"
@@ -4311,19 +4460,16 @@ def _fetch_douyin_collect() -> tuple[list[dict], str]:
     except ValueError:
         return [], "收藏数据解析失败——稍后重试"
     items = d.get("items") if isinstance(d, dict) else None
-    out = []
-    for it in items if isinstance(items, list) else []:
-        if not isinstance(it, dict):
-            continue
-        parts = []
-        if it.get("author"):
-            parts.append(f"作者 {it['author']}")
-        parts += [f"{k} {v}" for k, v in
-                  (("赞", it.get("digg")), ("评", it.get("comment"))) if v is not None]
-        out.append({"title": it.get("title", ""), "url": it.get("url", ""),
-                    "date": it.get("created", ""), "summary": " · ".join(parts),
-                    "cover": it.get("cover", "")})
-    return out, ""
+    return [_douyin_display_item(it, with_author=True)
+            for it in items if isinstance(it, dict)] if isinstance(items, list) else [], ""
+
+
+def _collect_served(items: list[dict], err: str, now: float) -> dict:
+    """收藏响应：最新一屏并入深度缓存后返回全量（页面刷新不缩回第一屏），带 has_more。"""
+    entry = _deep_upsert("collect", items)
+    updated = int(now) if items else int(entry["updated"] or now)
+    return {"items": entry["items"], "error": err, "updated": updated,
+            "has_more": entry["has_more"]}
 
 
 @app.get("/api/watchlist/collect")
@@ -4332,17 +4478,68 @@ async def api_watchlist_collect(refresh: int = 0):
 
     每次抓取要起一次无头浏览器，成功缓存 300s（与博主源一致）；失败缓存 60s，
     避免反复拉起浏览器；refresh=1 强制绕过缓存现拉（面板刷新按钮用）。
+    最新一屏之外的历史条目走 POST /load 按需深翻，这里负责把深度缓存合并进响应。
     """
     now = time.time()
     c = _WATCH_CACHE.get(_COLLECT_CACHE_KEY)
     if c and not refresh:
         ttl = WATCHLIST_CACHE_TTL if not c[2] else COLLECT_CACHE_TTL_ERR
         if now - c[0] < ttl:
-            return {"items": c[1], "error": c[2], "updated": int(c[0])}
+            return _collect_served(c[1], c[2], now)
     loop = asyncio.get_event_loop()
     items, err = await loop.run_in_executor(None, _fetch_douyin_collect)
     _WATCH_CACHE[_COLLECT_CACHE_KEY] = (now, items, err)
-    return {"items": items, "error": err, "updated": int(now)}
+    return _collect_served(items, err, now)
+
+
+class CollectLoadRequest(BaseModel):
+    want: int = WATCH_DEEP_BATCH
+
+
+@app.post("/api/watchlist/collect/load")
+async def api_watchlist_collect_load(req: CollectLoadRequest):
+    """收藏「加载更多」：相对已加载集合增量深翻 want 条（无头浏览器滚动翻页，较慢）。
+
+    200 + error 字段的软错误模式与收藏端点一致（未登录/风控/占线都不算请求失败）。
+    """
+    loop = asyncio.get_event_loop()
+    items, err, has_more = await loop.run_in_executor(
+        None, _douyin_deep_load, "collect", "", min(max(1, req.want), 30))
+    if err:
+        return {"items": [], "error": err, "updated": int(time.time()), "has_more": has_more}
+    return {"items": items, "error": "", "updated": int(time.time()), "has_more": has_more}
+
+
+class BloggerLoadRequest(BaseModel):
+    id: str
+    want: int = WATCH_DEEP_BATCH
+
+
+@app.post("/api/watchlist/blog/load")
+async def api_watchlist_blog_load(req: BloggerLoadRequest):
+    """单个博主「加载更多」：相对已加载集合增量深翻 want 条。
+
+    仅抖音源支持——RSS/Atom 源只暴露最新一批，没有「更早内容」可翻。"""
+    w = next((x for x in _read_watchlist() if x.get("id") == req.id), None)
+    if not w:
+        raise HTTPException(404, "博主不存在或已删除")
+    uid = w.get("uid") or _douyin_uid_from_feed(w.get("feed_url", ""))
+    if w.get("platform") != "douyin" or not uid:
+        raise HTTPException(400, "该博主不是抖音源——RSS 源没有更早内容可加载")
+    loop = asyncio.get_event_loop()
+    items, err, has_more = await loop.run_in_executor(
+        None, _douyin_deep_load, "blogger", uid, min(max(1, req.want), 30))
+    if err:
+        return {"error": err, "group": None}
+    # 统计（粉丝数/作品数）来自常规抓取时旁听的 profile XHR，深存一份，这里直接读
+    stats = _deep_get(f"douyin:{uid}").get("stats")
+    return {"error": "", "has_more": has_more, "group": {
+        "id": w.get("id", ""), "name": (w.get("name") or "").strip(), "platform": "douyin",
+        "items": [{k: it.get(k, "") for k in ("title", "url", "date", "summary", "cover")}
+                  for it in items],
+        "has_more": has_more,
+        "stats": stats,
+    }}
 
 
 @app.get("/api/watchlist")
@@ -4421,23 +4618,39 @@ async def api_watchlist_digest():
 
     async def one(w: dict) -> dict:
         # 平台分流：抖音走登录态抓取（键=sec_uid），其余走 RSS（键=feed_url）
-        if w.get("platform") == "douyin":
+        is_douyin = w.get("platform") == "douyin"
+        if is_douyin:
             key = w.get("uid") or _douyin_uid_from_feed(w.get("feed_url", ""))
             fetch = _fetch_douyin_source if key else None
         else:
             key = w["feed_url"]
             fetch = _fetch_rss_source
+        fetched_stats: dict | None = None
         c = _WATCH_CACHE.get(key)
         if c and now - c[0] < WATCHLIST_CACHE_TTL:
-            items = c[1]
+            fresh = c[1]
         elif fetch is not None:
-            items = await loop.run_in_executor(None, fetch, key)
-            if items:
-                _WATCH_CACHE[key] = (now, items)
+            if is_douyin:
+                fresh, fetched_stats = await loop.run_in_executor(None, fetch, key)
+            else:
+                fresh = await loop.run_in_executor(None, fetch, key)
+            if fresh:
+                _WATCH_CACHE[key] = (now, fresh)
             elif c:
-                items = c[1]   # 失败回落旧值，面板不因单源抖动报错
+                fresh = c[1]   # 失败回落旧值，面板不因单源抖动报错
         else:
-            items = []
+            fresh = []
+        stats_out = None
+        if is_douyin:
+            # 抖音源展示「已加载全量」= 深度缓存 ∪ 最新一屏（feed 字段留着供自动命名）；
+            # 更早的内容不预取，由「加载更多」按需深翻后落进深度缓存
+            if key:
+                entry = _deep_upsert(f"douyin:{key}", fresh, stats=fetched_stats)
+                items, has_more, stats_out = entry["items"], entry["has_more"], entry.get("stats")
+            else:
+                items, has_more = [], True
+        else:
+            items, has_more = fresh, False   # RSS/Atom 只暴露最新一批，没有翻页概念
         # 自动命名：名称为空或拿 URL 充数时，用数据源自带的源标题（RSS feed title /
         # 抖音博主昵称）回填并持久化——用户手填过的名字不动。
         display = (w.get("name") or "").strip()
@@ -4452,11 +4665,14 @@ async def api_watchlist_digest():
             "id": w.get("id", ""),
             "name": display,
             "platform": w.get("platform", ""),
+            "has_more": has_more,
+            "stats": stats_out,   # 粉丝数/作品数（仅抖音源；拿不到为 null）
             "items": [
-                {"title": it.get("title", ""), "url": it.get("link", ""),
-                 "date": it.get("_dt") or it.get("published", ""),
+                {"title": it.get("title", ""), "url": it.get("url", "") or it.get("link", ""),
+                 "date": it.get("date") or it.get("_dt") or it.get("published", ""),
                  "summary": it.get("summary", ""), "cover": it.get("cover", "")}
-                for it in items[:WATCHLIST_MAX_PER_SOURCE]
+                # 抖音源不截 15（深度缓存是用户主动按需拿回的）；RSS 仍按首屏上限截
+                for it in (items if is_douyin else items[:WATCHLIST_MAX_PER_SOURCE])
             ],
         }
 
@@ -4513,6 +4729,144 @@ class RssRouteRequest(BaseModel):
 async def api_watchlist_rss_route(req: RssRouteRequest):
     """平台 + 博主(ID 或主页链接) → RSS 地址。「我的关注」表单自动生成用。"""
     return {"feed_url": _resolve_feed_url(req.platform, req.blogger)}
+
+
+# ---- 视频文字转写（热点「做内容」链路：视频源 → 本地 whisper 转文字 → 随选题进对话） ----
+# 背景：「做内容」此前只把标题传给 agent，视频里实际说了什么全靠 agent 猜。这里在
+# 薄壳侧做确定性转写（不进 agent）：douyin_watch download 登录态下载视频 → asr.py
+# （faster-whisper，模型缓存在 ~/.cache/easel-models）转 txt → 结果按 aweme_id 落盘
+# outputs/_transcripts/（_ 前缀天然受删除保护、不进内容库）。成功缓存永久有效，
+# 失败（图文帖/风控/超长）也缓存 TRANSCRIPT_ERROR_TTL，避免每次点击都白跑一次浏览器。
+# 设计取舍见 docs/superpowers/specs/2026-10-02-douyin-video-transcript-design.md。
+_ASR_SCRIPT = SKILLS_DIR / "shared" / "scripts" / "asr.py"
+DOUYIN_VIDEO_RE = re.compile(r"douyin\.com/video/(\d{6,})")
+TRANSCRIPT_DIR = OUTPUTS_DIR / "_transcripts"
+TRANSCRIPT_ERROR_TTL = 24 * 3600     # 失败条目 24h 内不重试
+TRANSCRIPT_MAX_SECONDS = 15 * 60     # 时长上限：控制 ASR 子进程耗时与同步请求上限
+_TRANSCRIBE_LOCK = threading.Lock()  # 转写要起无头浏览器 + whisper，全局串行（同 _DEEP_RUN_LOCK 理由）
+
+
+def _transcript_file(aweme_id: str) -> Path:
+    return TRANSCRIPT_DIR / f"{aweme_id}.json"
+
+
+def _transcript_read(aweme_id: str) -> dict | None:
+    """缓存命中判定：成功条目永久有效；失败条目 TTL 内也算命中。损坏/过期/空文本
+    一律按未命中——宁可重转也不给空结果。"""
+    try:
+        d = json.loads(_transcript_file(aweme_id).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(d, dict):
+        return None
+    if d.get("ok") and isinstance(d.get("text"), str) and d["text"].strip():
+        return d
+    if d.get("error") and time.time() - (d.get("updated") or 0) < TRANSCRIPT_ERROR_TTL:
+        return d
+    return None
+
+
+def _transcript_write(aweme_id: str, url: str, *, text: str = "", duration: int | None = None,
+                      error: str = "", model: str = "") -> dict:
+    """写缓存（tmp+replace 原子写，同 _deep_write 模式）。成功与失败同构，ok 字段区分。"""
+    TRANSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
+    rec = {"id": aweme_id, "url": url, "ok": bool(text.strip()), "text": text,
+           "duration": duration, "model": model, "error": error, "updated": time.time()}
+    tmp = _transcript_file(aweme_id).with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(rec, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(_transcript_file(aweme_id))
+    return rec
+
+
+def _transcribe_douyin(url: str) -> dict:
+    """转写执行体（须持 _TRANSCRIBE_LOCK 调用）：登录态下载视频 → asr.py → 文本。
+
+    返回 {"text","duration","model"} 或 {"error"}。子进程必须用项目 .venv 解释器
+    （playwright/faster-whisper 都装在那，见 _script_python）；env 沿 _proxy_env——
+    asr 首次从 HuggingFace 下模型可能要外网代理，抖音侧由脚本自身 --no-proxy-server 直连。"""
+    tmpdir = Path(tempfile.mkdtemp(prefix="easel-transcribe-"))
+    video = tmpdir / "video.mp4"
+    txt = tmpdir / "transcript.txt"
+    try:
+        dl = [_script_python(), str(_DOUYIN_WATCH), "download", "--url", url,
+              "-o", str(video), "--timeout", "45"]
+        try:
+            proc = subprocess.run(dl, capture_output=True, text=True, encoding="utf-8",
+                                  errors="replace", timeout=180,
+                                  cwd=str(PROJECT_ROOT), env=_proxy_env())
+        except (OSError, subprocess.SubprocessError):
+            return {"error": "下载视频失败——本机执行环境异常，请稍后重试"}
+        if proc.returncode == 5:
+            return {"error": "该内容是图文或无音轨，无需转写语音"}
+        if proc.returncode == 8:
+            return {"error": "抖音未登录——请先在「账号」页登录抖音再试"}
+        if proc.returncode != 0:
+            return {"error": "视频下载失败——可能被风控拦截，稍后重试"}
+        try:
+            meta = json.loads(proc.stdout)
+        except ValueError:
+            return {"error": "下载结果解析失败——稍后重试"}
+        ms = meta.get("duration_ms")
+        duration = int(ms / 1000) if isinstance(ms, (int, float)) and ms > 0 else None
+        if duration and duration > TRANSCRIPT_MAX_SECONDS:
+            return {"error": f"视频约 {duration // 60} 分钟，超过 {TRANSCRIPT_MAX_SECONDS // 60} 分钟暂不支持自动转写"}
+        asr_cmd = [_script_python(), str(_ASR_SCRIPT), "transcribe", "-i", str(video),
+                   "--format", "txt", "-o", str(txt)]
+        try:
+            proc2 = subprocess.run(asr_cmd, capture_output=True, text=True, encoding="utf-8",
+                                   errors="replace", timeout=1200,
+                                   cwd=str(PROJECT_ROOT), env=_proxy_env())
+        except (OSError, subprocess.SubprocessError):
+            return {"error": "语音转写失败——本机执行环境异常，请稍后重试"}
+        if proc2.returncode != 0:
+            tail = "；".join((proc2.stderr or "").strip().splitlines()[-3:])
+            return {"error": f"语音转写失败：{tail or '稍后重试'}"}
+        text = txt.read_text(encoding="utf-8").strip() if txt.is_file() else ""
+        if not text:
+            return {"error": "未识别到语音内容（可能是纯音乐/无解说画面）"}
+        return {"text": text, "duration": duration, "model": "faster-whisper-base"}
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+class TranscribeRequest(BaseModel):
+    url: str
+
+
+def _transcript_response(rec: dict, cached: bool) -> dict:
+    """缓存放前端/消息里展示的形状。path 用 outputs/ 相对路径（agent 可按需读全文）。"""
+    return {"ok": bool(rec.get("ok")), "cached": cached, "text": rec.get("text") or "",
+            "duration": rec.get("duration"), "error": rec.get("error") or "",
+            "path": f"outputs/_transcripts/{rec['id']}.json"}
+
+
+@app.post("/api/transcribe")
+async def api_transcribe(req: TranscribeRequest):
+    """把抖音视频的语音转成文字（做内容链路）。结果按 aweme_id 缓存，命中即时返回。
+
+    失败返回 200 + ok=false（沿「200+error 字段不算请求失败」约定），前端静默回落
+    仅标题，不阻断创作；仅非法链接 400。同步等待：一两分钟的视频全程几十秒
+    （下载 ~15s + 本地 base/int8 转写 ≈ 数秒到数十秒），转写过的直接走缓存。"""
+    m = DOUYIN_VIDEO_RE.search(req.url or "")
+    if not m:
+        raise HTTPException(400, "仅支持抖音视频链接（douyin.com/video/<id>）")
+    aweme_id = m.group(1)
+    hit = _transcript_read(aweme_id)
+    if hit:
+        return _transcript_response(hit, cached=True)
+
+    def _work() -> dict:
+        with _TRANSCRIBE_LOCK:
+            again = _transcript_read(aweme_id)   # 双检：等锁期间可能已被并发请求转好
+            if again:
+                return _transcript_response(again, cached=True)
+            out = _transcribe_douyin(req.url)
+            rec = _transcript_write(aweme_id, req.url, text=out.get("text", ""),
+                                    duration=out.get("duration"),
+                                    error=out.get("error", ""), model=out.get("model", ""))
+            return _transcript_response(rec, cached=False)
+
+    return await asyncio.get_event_loop().run_in_executor(None, _work)
 
 
 SCHEDULE_FILE = OUTPUTS_DIR / "_schedule.json"

@@ -18,6 +18,8 @@ interface TrendRowProps {
   saved: boolean;
   onSave: () => void;
   onUse: () => void;
+  /** 做内容准备中（视频源在转写语音）：按钮禁用并常显，防止重复点击 */
+  busy?: boolean;
   /** 标题允许折两行（博主/收藏有正文摘要，热搜榜单行更利落） */
   clamp?: boolean;
 }
@@ -35,7 +37,7 @@ function fmtHot(v: string): string {
 export default function TrendRow(props: TrendRowProps) {
   const {
     index, title, url, hot, cover, date, summary,
-    sourceLabel, sourceColor, hotTrailing, saved, onSave, onUse, clamp,
+    sourceLabel, sourceColor, hotTrailing, saved, onSave, onUse, busy, clamp,
   } = props;
   return (
     <div className="trend-item">
@@ -67,8 +69,13 @@ export default function TrendRow(props: TrendRowProps) {
       >
         {saved ? <IconCheck size={14} /> : <IconBookmark size={14} />}
       </button>
-      <button className="trend-use" title="做成内容" onClick={onUse}>
-        做内容
+      <button
+        className="trend-use"
+        title={busy ? '正在转写视频语音（首次需下载本地模型，会慢一些）' : '做成内容'}
+        onClick={onUse}
+        disabled={busy}
+      >
+        {busy ? (url ? '转写中…' : '准备中…') : '做内容'}
       </button>
     </div>
   );

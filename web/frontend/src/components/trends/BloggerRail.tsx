@@ -41,7 +41,7 @@ export default function BloggerRail({ groups, active, onChange, onAdd, empty }: 
           </span>
           <span className="rail-meta">
             <span className="rail-name">{g.name}</span>
-            <span className="rail-sub">{g.items.length === 0 ? '源不可用' : mediaSub(g.platform)}</span>
+            <span className="rail-sub">{railSub(g)}</span>
           </span>
           <span className="rail-count">{g.items.length}</span>
         </button>
@@ -59,4 +59,19 @@ export default function BloggerRail({ groups, active, onChange, onAdd, empty }: 
 function mediaSub(platform: string): string {
   if (platform === 'douyin' || platform === 'bilibili' || platform === 'xiaohongshu') return '自动 RSS';
   return '手填 RSS';
+}
+
+// 副标题：抓到博主统计（抖音源打开主页顺带旁听 profile 接口）就展示，否则退回来源说明
+function railSub(g: WatchGroup): string {
+  const { follower_count: f, aweme_count: a } = g.stats ?? {};
+  if (f != null || a != null) return `粉丝 ${fmtCount(f)} · 作品 ${fmtCount(a)}`;
+  return g.items.length === 0 ? '源不可用' : mediaSub(g.platform);
+}
+
+/** 大数中文缩写：12345 → 1.2万，1.2亿；空值显示 — */
+function fmtCount(n?: number | null): string {
+  if (n == null) return '—';
+  if (n >= 1e8) return `${(n / 1e8).toFixed(1).replace(/\.0$/, '')}亿`;
+  if (n >= 1e4) return `${(n / 1e4).toFixed(1).replace(/\.0$/, '')}万`;
+  return String(n);
 }
