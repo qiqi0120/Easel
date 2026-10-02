@@ -720,7 +720,7 @@ export default function App() {
           />
         ) : null;
       case 'trends':
-        return <TrendsPage onUseTopic={handleUseTopic} />;
+        return <TrendsPage onUseTopic={handleUseTopic} onNavigate={setCurrentPage} />;
       case 'ideas':
         return <IdeasPage onUseTopic={handleUseTopic} />;
       case 'calendar':
